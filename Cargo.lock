@@ -956,6 +956,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiermem"
+version = "0.1.0"
+dependencies = [
+ "cutile",
+]
+
+[[package]]
 name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -985,7 +992,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vecadd_demo"
+name = "vecadd"
 version = "0.1.0"
 dependencies = [
  "cutile",

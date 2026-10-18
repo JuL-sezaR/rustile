@@ -1,7 +1,11 @@
-[package]
-name = "vecadd_demo"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = ["vecadd", "tiermem"]
 
-[dependencies]
-cutile = "0.4.0"
+[workspace.package]
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# cutile and its CUDA crates are pre-1.0; pin exactly so upgrades are deliberate.
+cutile = "=0.4.0"
