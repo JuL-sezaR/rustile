@@ -185,3 +185,66 @@ fn pressure_fires_on_crossing_the_soft_limit() {
         "fires once per crossing, before the budget is hit"
     );
 }
+
+#[test]
+fn lookahead_evicts_the_tensor_needed_farthest_away() {
+    let mut m = manager(Policy::EvictLookahead);
+    let a = m.register(tensor(0.0), Hint::Evictable).unwrap();
+    let b = m.register(tensor(1.0), Hint::Evictable).unwrap();
+    let c = m.register(tensor(2.0), Hint::Evictable).unwrap();
+    // a is least recent, so LRU would evict it; lookahead keeps it.
+    m.expect_accesses(&[a, c, b]).unwrap();
+    let d = m.register(tensor(3.0), Hint::Evictable).unwrap();
+    assert!(!m.is_resident(b), "b is needed last");
+    for id in [a, c, d] {
+        assert!(m.is_resident(id));
+    }
+}
+
+#[test]
+fn lookahead_evicts_undeclared_tensors_first() {
+    let mut m = manager(Policy::EvictLookahead);
+    let a = m.register(tensor(0.0), Hint::Evictable).unwrap();
+    let b = m.register(tensor(1.0), Hint::Evictable).unwrap();
+    let c = m.register(tensor(2.0), Hint::Evictable).unwrap();
+    m.expect_accesses(&[a, b]).unwrap();
+    m.register(tensor(3.0), Hint::Evictable).unwrap();
+    assert!(!m.is_resident(c), "c has no declared use");
+    assert!(m.is_resident(a) && m.is_resident(b));
+}
+
+#[test]
+fn lookahead_consumes_declarations_as_tensors_are_used() {
+    let mut m = manager(Policy::EvictLookahead);
+    let a = m.register(tensor(0.0), Hint::Evictable).unwrap();
+    let b = m.register(tensor(1.0), Hint::Evictable).unwrap();
+    let c = m.register(tensor(2.0), Hint::Evictable).unwrap();
+    m.expect_accesses(&[a, b, c, a]).unwrap();
+    // Skipping a and b consumes their declarations; only the final a remains.
+    m.ensure_resident(&[c]).unwrap();
+    m.register(tensor(3.0), Hint::Evictable).unwrap();
+    assert!(m.is_resident(a), "a is still expected");
+    assert!(!m.is_resident(b), "b's declared use was skipped");
+}
+
+#[test]
+fn lru_ignores_declared_accesses() {
+    let mut m = manager(Policy::EvictLru);
+    let a = m.register(tensor(0.0), Hint::Evictable).unwrap();
+    let b = m.register(tensor(1.0), Hint::Evictable).unwrap();
+    m.register(tensor(2.0), Hint::Evictable).unwrap();
+    m.expect_accesses(&[a, b]).unwrap();
+    m.register(tensor(3.0), Hint::Evictable).unwrap();
+    assert!(!m.is_resident(a));
+}
+
+#[test]
+fn expect_accesses_rejects_unknown_tensors() {
+    let mut m = manager(Policy::EvictLookahead);
+    let a = m.register(tensor(0.0), Hint::Evictable).unwrap();
+    m.unregister(a).unwrap();
+    assert!(matches!(
+        m.expect_accesses(&[a]),
+        Err(TierError::UnknownTensor(_))
+    ));
+}

@@ -18,7 +18,8 @@ pub use error::{EntrySnapshot, Snapshot, TierError};
 pub use trace::{Event, EventKind, Trace};
 
 use cutile::prelude::*;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
 /// How expensive a tensor is to move off the device, in eviction order.
@@ -59,6 +60,11 @@ pub enum Policy {
     Strict,
     /// Evict by hint rank, then least-recently-used.
     EvictLru,
+    /// Evict by hint rank, then by the access order declared with
+    /// [`Manager::expect_accesses`]: tensors with no declared use go first
+    /// (least-recently-used among them), then the one needed farthest in the
+    /// future. With nothing declared this is the same as `EvictLru`.
+    EvictLookahead,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +137,8 @@ pub struct Manager<T: DType> {
     entries: HashMap<TensorId, Entry<T>>,
     next_id: u64,
     clock: u64,
+    /// Declared future accesses, next first; consumed by `ensure_resident`.
+    expected: VecDeque<TensorId>,
     stats: Stats,
     above_soft_limit: bool,
     on_pressure: Option<Box<dyn FnMut(Pressure)>>,
@@ -148,6 +156,7 @@ impl<T: DType> Manager<T> {
             entries: HashMap::new(),
             next_id: 0,
             clock: 0,
+            expected: VecDeque::new(),
             stats: Stats::default(),
             above_soft_limit: false,
             on_pressure: None,
@@ -217,6 +226,7 @@ impl<T: DType> Manager<T> {
             .entries
             .remove(&id)
             .ok_or(TierError::UnknownTensor(id))?;
+        self.expected.retain(|&e| e != id);
         match entry.location {
             Location::Device(t) => {
                 self.sub_resident(entry.bytes);
@@ -243,8 +253,31 @@ impl<T: DType> Manager<T> {
             }
             self.clock += 1;
             self.entries.get_mut(&id).unwrap().last_use = self.clock;
+            // Accesses the workload skipped are dropped along with this one.
+            if let Some(pos) = self.expected.iter().position(|&e| e == id) {
+                self.expected.drain(..=pos);
+            }
         }
         Ok(())
+    }
+
+    /// Declares that `ids` will be passed to [`Manager::ensure_resident`] in
+    /// this order, after any accesses declared earlier. Only
+    /// [`Policy::EvictLookahead`] uses this.
+    ///
+    /// Each `ensure_resident` of a declared tensor consumes the declaration
+    /// up to and including its first occurrence, so a stale plan corrects
+    /// itself; [`Manager::clear_expected`] discards it outright.
+    pub fn expect_accesses(&mut self, ids: &[TensorId]) -> Result<(), TierError> {
+        if let Some(&id) = ids.iter().find(|id| !self.entries.contains_key(id)) {
+            return Err(TierError::UnknownTensor(id));
+        }
+        self.expected.extend(ids);
+        Ok(())
+    }
+
+    pub fn clear_expected(&mut self) {
+        self.expected.clear();
     }
 
     /// The device tensor for `id`, which must be resident (see
@@ -302,8 +335,10 @@ impl<T: DType> Manager<T> {
         while self.stats.resident_bytes + bytes > self.config.budget_bytes {
             let victim = self.pick_victim(protect);
             match (self.config.policy, victim) {
-                (Policy::EvictLru, Some(id)) => self.evict(id)?,
-                (_, victim) => return Err(self.budget_exceeded(bytes, victim.is_some())),
+                (Policy::Strict, victim) | (_, victim @ None) => {
+                    return Err(self.budget_exceeded(bytes, victim.is_some()));
+                }
+                (_, Some(id)) => self.evict(id)?,
             }
         }
         Ok(())
@@ -319,10 +354,20 @@ impl<T: DType> Manager<T> {
     }
 
     fn pick_victim(&self, protect: &[TensorId]) -> Option<TensorId> {
+        // Position of each tensor's next declared use; absent means none.
+        let mut next_use = HashMap::new();
+        if self.config.policy == Policy::EvictLookahead {
+            for (pos, &id) in self.expected.iter().enumerate() {
+                next_use.entry(id).or_insert(pos);
+            }
+        }
         self.entries
             .iter()
             .filter(|(id, e)| e.is_resident() && !protect.contains(id))
-            .filter_map(|(&id, e)| Some(((e.hint.eviction_rank()?, e.last_use), id)))
+            .filter_map(|(&id, e)| {
+                let next = next_use.get(&id).copied().unwrap_or(usize::MAX);
+                Some(((e.hint.eviction_rank()?, Reverse(next), e.last_use), id))
+            })
             .min()
             .map(|(_, id)| id)
     }

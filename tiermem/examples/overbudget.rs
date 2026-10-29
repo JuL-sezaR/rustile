@@ -1,13 +1,16 @@
 //! Streams a stack of "layer weights" whose total size exceeds a VRAM budget
 //! through a kernel, the way inference walks a model's layers.
 //!
-//!   cargo run --release -p tiermem --example overbudget -- [MODE] [--budget-mib N]
-//!       [--layers N] [--layer-mib N] [--epochs N] [--trace PATH]
+//!   cargo run --release -p tiermem --example overbudget -- [MODE] [--lookahead]
+//!       [--budget-mib N] [--layers N] [--layer-mib N] [--epochs N] [--trace PATH]
 //!
 //! MODE is one of:
 //!   strict       no eviction: behaves like a GPU with only --budget-mib of memory
 //!   spill        evict LRU, spilling contents to host RAM and copying them back
 //!   rebuild      evict LRU, dropping contents and regenerating them on the device
+//!
+//! --lookahead declares the layer order up front and evicts the layer needed
+//! farthest in the future instead of the least recently used one.
 //!
 //! The two accumulator buffers are not managed and sit outside the budget.
 
@@ -47,6 +50,7 @@ enum Mode {
 
 struct Args {
     mode: Mode,
+    lookahead: bool,
     budget_mib: usize,
     layers: usize,
     layer_mib: usize,
@@ -57,6 +61,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut args = Args {
         mode: Mode::Spill,
+        lookahead: false,
         budget_mib: 256,
         layers: 12,
         layer_mib: 64,
@@ -74,6 +79,7 @@ fn parse_args() -> Args {
             "strict" => args.mode = Mode::Strict,
             "spill" => args.mode = Mode::Spill,
             "rebuild" => args.mode = Mode::Rebuild,
+            "--lookahead" => args.lookahead = true,
             "--budget-mib" => args.budget_mib = num("--budget-mib"),
             "--layers" => args.layers = num("--layers"),
             "--layer-mib" => args.layer_mib = num("--layer-mib"),
@@ -95,6 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let policy = match args.mode {
         Mode::Strict => Policy::Strict,
+        Mode::Spill | Mode::Rebuild if args.lookahead => Policy::EvictLookahead,
         Mode::Spill | Mode::Rebuild => Policy::EvictLru,
     };
     let mut mgr = Manager::<f32>::new(Config::new(args.budget_mib * MIB, policy));
@@ -103,12 +110,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mgr.on_pressure(move |_| counter.set(counter.get() + 1));
 
     println!(
-        "mode={} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
+        "mode={}{} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
         match args.mode {
             Mode::Strict => "strict",
             Mode::Spill => "spill",
             Mode::Rebuild => "rebuild",
         },
+        if args.lookahead { " lookahead" } else { "" },
         args.budget_mib,
         args.layers * args.layer_mib,
         args.layers,
@@ -149,6 +157,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut acc = api::zeros::<f32>(&[len]).sync()?;
     let mut out = api::zeros::<f32>(&[len]).sync()?;
+    if args.lookahead {
+        for _ in 0..args.epochs {
+            mgr.expect_accesses(&layers)?;
+        }
+    }
     for _ in 0..args.epochs {
         for &id in &layers {
             mgr.ensure_resident(&[id])?;
