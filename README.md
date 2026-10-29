@@ -1,4 +1,4 @@
-# vecadd_demo → tiermem
+# rustile → tiermem
 
 Toward an AI-aware OS layer: coordinated memory, scheduling and observability
 for ML workloads across CPU RAM, GPU VRAM and other accelerators.
