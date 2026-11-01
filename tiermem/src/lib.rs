@@ -98,9 +98,14 @@ pub struct Pressure {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Stats {
     pub resident_bytes: usize,
+    /// Bytes of evicted tensors whose contents live in host RAM.
     pub spilled_bytes: usize,
+    /// All host RAM held: spilled tensors plus clean copies of resident ones.
+    pub host_bytes: usize,
     pub peak_resident_bytes: usize,
     pub evictions: u64,
+    /// Evictions that reused a clean host copy instead of copying to the host.
+    pub clean_evictions: u64,
     pub reloads: u64,
     pub reconstructions: u64,
     pub bytes_to_host: u64,
@@ -123,6 +128,10 @@ struct Entry<T: DType> {
     bytes: usize,
     shape: Vec<usize>,
     location: Location<T>,
+    /// For a resident tensor reloaded from the host: the contents it was
+    /// reloaded from, still valid because nothing has written to it since.
+    /// Evicting it again reuses this instead of copying back to the host.
+    clean_copy: Option<Arc<Vec<T>>>,
     last_use: u64,
 }
 
@@ -212,6 +221,7 @@ impl<T: DType> Manager<T> {
                 bytes,
                 shape,
                 location: Location::Device(tensor),
+                clean_copy: None,
                 last_use: self.clock,
             },
         );
@@ -227,6 +237,9 @@ impl<T: DType> Manager<T> {
             .remove(&id)
             .ok_or(TierError::UnknownTensor(id))?;
         self.expected.retain(|&e| e != id);
+        if entry.clean_copy.is_some() {
+            self.stats.host_bytes -= entry.bytes;
+        }
         match entry.location {
             Location::Device(t) => {
                 self.sub_resident(entry.bytes);
@@ -234,6 +247,7 @@ impl<T: DType> Manager<T> {
             }
             Location::Host(_) => {
                 self.stats.spilled_bytes -= entry.bytes;
+                self.stats.host_bytes -= entry.bytes;
                 Ok(None)
             }
             Location::Dropped => Ok(None),
@@ -292,6 +306,28 @@ impl<T: DType> Manager<T> {
             Location::Device(t) => Ok(t),
             _ => Err(TierError::NotResident(id)),
         }
+    }
+
+    /// Mutable access to the device tensor for `id`, which must be resident.
+    ///
+    /// Marks the tensor dirty: its clean host copy, if any, is freed and the
+    /// next eviction copies the contents back to the host. Replacing the
+    /// tensor with one of a different shape is a bug.
+    ///
+    /// Writes to a reconstructible tensor do not survive eviction: it is
+    /// rebuilt from its original recipe.
+    pub fn tensor_mut(&mut self, id: TensorId) -> Result<&mut Tensor<T>, TierError> {
+        let entry = self
+            .entries
+            .get_mut(&id)
+            .ok_or(TierError::UnknownTensor(id))?;
+        let Location::Device(t) = &mut entry.location else {
+            return Err(TierError::NotResident(id));
+        };
+        if entry.clean_copy.take().is_some() {
+            self.stats.host_bytes -= entry.bytes;
+        }
+        Ok(t)
     }
 
     pub fn is_resident(&self, id: TensorId) -> bool {
@@ -380,11 +416,16 @@ impl<T: DType> Manager<T> {
         else {
             unreachable!("only resident tensors are eviction victims");
         };
-        let spilled = match entry.backing {
-            Backing::Spill => match tensor.to_host_vec().sync() {
+        let (spilled, copied) = match (&entry.backing, entry.clean_copy.take()) {
+            (Backing::Spill, Some(host)) => {
+                drop(tensor);
+                entry.location = Location::Host(host);
+                (true, false)
+            }
+            (Backing::Spill, None) => match tensor.to_host_vec().sync() {
                 Ok(host) => {
                     entry.location = Location::Host(Arc::new(host));
-                    true
+                    (true, true)
                 }
                 // The copy consumed the tensor, so its contents are lost.
                 Err(e) => {
@@ -393,16 +434,21 @@ impl<T: DType> Manager<T> {
                     return Err(TierError::Device(e.into()));
                 }
             },
-            Backing::Reconstruct(_) => false,
+            (Backing::Reconstruct(_), _) => (false, false),
         };
         self.sub_resident(bytes);
         self.stats.evictions += 1;
         if spilled {
             self.stats.spilled_bytes += bytes;
+        }
+        if copied {
+            self.stats.host_bytes += bytes;
             self.stats.bytes_to_host += bytes as u64;
+        } else if spilled {
+            self.stats.clean_evictions += 1;
         }
         self.trace
-            .span(EventKind::Evict { spilled }, Some(id), bytes, start);
+            .span(EventKind::Evict { spilled, copied }, Some(id), bytes, start);
         Ok(())
     }
 
@@ -422,7 +468,11 @@ impl<T: DType> Manager<T> {
                 unreachable!("spilled tensors are kept on the host")
             }
         };
-        entry.location = Location::Device(tensor);
+        let old = std::mem::replace(&mut entry.location, Location::Device(tensor));
+        if let Location::Host(host) = old {
+            // Kept as a clean copy, so host_bytes is unchanged.
+            entry.clean_copy = Some(host);
+        }
         let kind = if was_spilled {
             self.stats.spilled_bytes -= bytes;
             self.stats.reloads += 1;

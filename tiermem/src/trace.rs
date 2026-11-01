@@ -12,7 +12,11 @@ pub enum EventKind {
     Admit,
     AdmitFailed,
     Evict {
+        /// The contents were kept in host RAM rather than dropped.
         spilled: bool,
+        /// They were copied off the device; false when a clean host copy
+        /// was reused.
+        copied: bool,
     },
     Reload,
     Reconstruct,
@@ -26,8 +30,15 @@ impl EventKind {
         match self {
             EventKind::Admit => "admit",
             EventKind::AdmitFailed => "admit_failed",
-            EventKind::Evict { spilled: true } => "evict_spill",
-            EventKind::Evict { spilled: false } => "evict_drop",
+            EventKind::Evict {
+                spilled: true,
+                copied: true,
+            } => "evict_spill",
+            EventKind::Evict {
+                spilled: true,
+                copied: false,
+            } => "evict_clean",
+            EventKind::Evict { spilled: false, .. } => "evict_drop",
             EventKind::Reload => "reload",
             EventKind::Reconstruct => "reconstruct",
             EventKind::Pressure => "pressure",

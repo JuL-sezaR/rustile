@@ -248,3 +248,93 @@ fn expect_accesses_rejects_unknown_tensors() {
         Err(TierError::UnknownTensor(_))
     ));
 }
+
+/// Registers `a` (all 7.0) and three fillers, then reloads `a`, which spills
+/// `b`. Returns `[a, b, c, d]`; `a` is resident with a clean host copy.
+fn reloaded_spill(m: &mut Manager<f32>) -> [tiermem::TensorId; 4] {
+    let ids = [7.0, 1.0, 2.0, 3.0].map(|v| m.register(tensor(v), Hint::Evictable).unwrap());
+    assert!(!m.is_resident(ids[0]));
+    m.ensure_resident(&ids[..1]).unwrap();
+    assert!(!m.is_resident(ids[1]));
+    ids
+}
+
+#[test]
+fn clean_reeviction_skips_the_copy() {
+    let mut m = manager(Policy::EvictLru);
+    let [a, b, c, d] = reloaded_spill(&mut m);
+    m.ensure_resident(&[c, d]).unwrap(); // a is now least recent
+    let before = m.stats().bytes_to_host;
+    m.ensure_resident(&[b]).unwrap();
+    assert!(!m.is_resident(a));
+    let s = m.stats();
+    assert_eq!(
+        s.bytes_to_host, before,
+        "unchanged weights are not copied back"
+    );
+    assert_eq!(s.clean_evictions, 1);
+
+    m.ensure_resident(&[a]).unwrap();
+    let host = m
+        .unregister(a)
+        .unwrap()
+        .unwrap()
+        .to_host_vec()
+        .sync()
+        .unwrap();
+    assert!(host.iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn tensor_mut_forces_write_back() {
+    let mut m = manager(Policy::EvictLru);
+    let [a, b, c, d] = reloaded_spill(&mut m);
+    let host_before = m.stats().host_bytes;
+    *m.tensor_mut(a).unwrap() = tensor(9.0);
+    assert_eq!(
+        m.stats().host_bytes,
+        host_before - BYTES,
+        "clean copy dropped"
+    );
+
+    m.ensure_resident(&[c, d]).unwrap();
+    let before = m.stats().bytes_to_host;
+    m.ensure_resident(&[b]).unwrap();
+    assert!(!m.is_resident(a));
+    let s = m.stats();
+    assert_eq!(s.bytes_to_host, before + BYTES as u64);
+    assert_eq!(s.clean_evictions, 0);
+
+    m.ensure_resident(&[a]).unwrap();
+    let host = m
+        .unregister(a)
+        .unwrap()
+        .unwrap()
+        .to_host_vec()
+        .sync()
+        .unwrap();
+    assert!(
+        host.iter().all(|&v| v == 9.0),
+        "reload sees the new contents"
+    );
+}
+
+#[test]
+fn tensor_mut_requires_residency() {
+    let mut m = manager(Policy::EvictLru);
+    let [_, b, _, _] = reloaded_spill(&mut m);
+    assert!(matches!(m.tensor_mut(b), Err(TierError::NotResident(_))));
+}
+
+#[test]
+fn host_bytes_tracks_spills_and_clean_copies() {
+    let mut m = manager(Policy::EvictLru);
+    let [a, b, ..] = reloaded_spill(&mut m);
+    let s = m.stats();
+    assert_eq!(s.host_bytes, 2 * BYTES, "a's clean copy plus spilled b");
+    assert_eq!(s.spilled_bytes, BYTES, "only b is evicted");
+    m.unregister(a).unwrap();
+    assert_eq!(m.stats().host_bytes, BYTES);
+    m.unregister(b).unwrap();
+    assert_eq!(m.stats().host_bytes, 0);
+}

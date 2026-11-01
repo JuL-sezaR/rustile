@@ -50,6 +50,7 @@ What these show, and what to fix next:
 - **Spilling re-copies unchanged weights.** Weights are read-only, yet each
   eviction copied them back to host RAM (2816 MiB of the traffic). Keeping a
   clean host copy for immutable tensors would make eviction just a free.
+  *Done, see below.*
 - **Migration is synchronous and goes through pageable memory.** Next step:
   pinned host buffers and a separate copy stream, so reloads overlap compute.
 - **Pressure fires on every re-crossing** (45 times here). It needs
@@ -77,6 +78,27 @@ Same benchmark (RTX 5080 Laptop, WSL2, 2026-10-29):
 misses, not fewer: skipping write-back of clean weights (next item) and
 overlapping reloads with compute. Prefetching only pays off once copies are
 asynchronous.
+
+## Clean host copies
+
+A spilled tensor that is reloaded keeps its host copy. As long as nothing
+writes to it, the next eviction just frees the device memory. The only way to
+write is `Manager::tensor_mut`, which drops the clean copy, so the next
+eviction copies the tensor back. `Stats::clean_evictions` counts the
+evictions that skipped the copy, and `Stats::host_bytes` reports all host RAM
+held, which now includes copies of resident tensors.
+
+Same benchmark (RTX 5080 Laptop, WSL2, 2026-11-01):
+
+| Mode | Time | To host | To device | Bytes moved | Host RAM held |
+|---|---|---|---|---|---|
+| spill, LRU | 0.80 s (was 1.59) | 768 MiB | 2304 MiB | 3072 MiB (was 5120) | 768 MiB |
+| spill, lookahead | 0.61 s (was 1.21) | 704 MiB | 1728 MiB | 2432 MiB (was 3968) | 704 MiB |
+
+Each layer now goes to the host once, the first time it is evicted. The rest
+of the traffic is reloads, which only asynchronous copies can hide. The cost
+is host RAM: clean copies stay until the tensor is written to or
+unregistered, and nothing limits host memory yet.
 
 ## Limitations
 

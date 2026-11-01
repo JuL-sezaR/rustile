@@ -198,6 +198,10 @@ fn finish(
     println!("time            {:.3} s", elapsed.as_secs_f64());
     println!("peak resident   {} MiB", s.peak_resident_bytes / MIB);
     println!("evictions       {}", s.evictions);
+    println!(
+        "clean evictions {} (no copy back to host)",
+        s.clean_evictions
+    );
     println!("reloads         {}", s.reloads);
     println!("reconstructions {}", s.reconstructions);
     println!(
@@ -205,6 +209,7 @@ fn finish(
         s.bytes_to_host / MIB as u64,
         s.bytes_to_device / MIB as u64
     );
+    println!("host RAM held   {} MiB", s.host_bytes / MIB);
     println!("pressure events {pressure_events}");
     if let Some(path) = &args.trace {
         mgr.trace().write_chrome_trace(path)?;
