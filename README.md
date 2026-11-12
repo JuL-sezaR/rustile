@@ -15,7 +15,7 @@ here.
 
 | Crate | What it is |
 |---|---|
-| [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction and prefetch on a separate copy stream, a host RAM limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
+| [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction and prefetch on a separate copy stream, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
@@ -30,6 +30,7 @@ cargo run --release -p tiermem --example overbudget -- rebuild   # LRU, regenera
 cargo run --release -p tiermem --example overbudget -- spill --lookahead  # declared layer order
 cargo run --release -p tiermem --example overbudget -- spill --lookahead --prefetch 1  # reload ahead of use
 cargo run --release -p tiermem --example overbudget -- spill --lookahead --host-limit-mib 576  # cap host RAM
+cargo run --release -p tiermem --example overbudget -- spill --lookahead --host-alloc eager  # page-lock host RAM up front
 cargo run --release -p tiermem --example overbudget -- spill --budget-mib 1024  # everything fits
 # add --work N to run the kernel N times per layer (a heavier layer)
 # add --trace out.json and open it in ui.perfetto.dev
@@ -135,9 +136,11 @@ day (RTX 5080 Laptop, WSL2, 2026-11-12; times vary by about ±10% run to run):
 | fits in budget | — | 0.07 s | — | 0.17 s |
 
 A 64 MiB reload now takes about 2.4 ms. What is left in the short run is
-setup: page-locking a 64 MiB buffer takes about 29 ms here, and it happens
-once per layer, the first time it is spilled (about 320 ms of the 3-epoch
-run). It does not recur, which is why the 30-epoch run gains more.
+mostly page-locking the host buffers. It happens once per layer, the first
+time it is spilled, and does not recur, which is why the 30-epoch run gains
+more. (This section first put that cost at 29 ms per 64 MiB buffer, about
+320 ms per run. Timed directly it is about 18 ms per buffer and 0.2 s per
+run; see "Host memory pool" below.)
 
 Prefetch only pays when there is compute to overlap with. One pass of the add
 kernel takes about 0.3 ms per layer, far less than the copy, so `--work N`
@@ -149,8 +152,8 @@ runs it N times per layer (30 epochs, lookahead):
 | 8 kernels (~2.7 ms) | 0.97 s | 1.87 s | 1.38 s | about half |
 | 32 kernels (~10 ms) | 3.67 s | 4.53 s | 3.99 s | about 60% |
 
-All of these runs still include the ~0.3 s of one-time page-locking, which
-accounts for most of the 0.32 s that remains with 32 kernels per layer. Prefetching reloads slightly more (10 layers
+All of these runs still include about 0.2 s of one-time page-locking, which
+is part of the 0.32 s that remains with 32 kernels per layer. Prefetching reloads slightly more (10 layers
 per epoch instead of 9, because one of the four slots holds the incoming
 layer). `--prefetch 2` measured the same as 1: copies on one stream run one
 after another.
@@ -172,12 +175,75 @@ page-locked buffer for the spill. If none are left, the eviction fails with
 the recoverable `TierError::HostBudgetExceeded` and the tensor stays on the
 device.
 
-With `--lookahead --host-limit-mib 576` the benchmark passes in 0.51 s, with
-29 clean copies given up and 2432 MiB copied to the host instead of 704: a
-tensor without a clean copy has to be copied back when it is evicted. 576 MiB
+With `--lookahead --host-limit-mib 576` the benchmark passes in 0.33 s, with
+4 clean copies given up and 832 MiB copied to the host instead of 704: a
+tensor without a clean copy has to be copied back when it is evicted. (An
+earlier version of this section reported 29 clean copies and 2432 MiB. That
+was measured before a freed buffer was reused for the next spill, and the
+text was not updated when that changed.) 576 MiB
 is the minimum here, the 512 MiB that cannot be on the device plus one layer,
 because a victim is spilled before the incoming layer's host copy can be
 released.
+
+## Host memory pool
+
+Page-locked host memory now comes from a pool (`tiermem/src/host.rs`) instead
+of one driver allocation per tensor. A block that is given back, because its
+tensor was written to, unregistered, or lost its clean copy to the host
+limit, goes on a free list and serves a later spill without being locked
+again. The pool hands out bytes, so tensors of any element type can share it.
+
+`Config::host_alloc` chooses when the memory is locked:
+
+- `HostAlloc::Lazy` (the default) locks a block the first time a spill finds
+  no free one, as before.
+- `HostAlloc::Eager` locks one arena of `Config::host_limit_bytes` when the
+  first spillable tensor is registered, and never grows it.
+
+`Stats::pinned_bytes` and `Stats::pin_time` report what was locked and how
+long it took. The benchmark now splits its time into setup (creating and
+registering the layers), run (the epochs) and the final check, because
+registering 12 layers under a 4-layer budget already spills 8 of them.
+
+Same benchmark, previous commit against this one (RTX 5080 Laptop, WSL2,
+2026-11-12; median of 5 processes after one warmup process, nothing else
+excluded; the previous commit only reports a total):
+
+| Mode | Total, before | Total, lazy | Total, eager | Run only, lazy | Run only, eager |
+|---|---|---|---|---|---|
+| spill, LRU, 3 epochs | 0.42 s | 0.42 s | 0.42 s | 0.20 s | 0.11 s |
+| spill, lookahead, 3 epochs | 0.37 s | 0.37 s | 0.40 s | 0.15 s | 0.086 s |
+| spill, LRU, 30 epochs | 1.41 s | 1.31 s | 1.38 s | 1.08 s | 1.00 s |
+| spill, lookahead, 30 epochs | 1.08 s | 1.08 s | 1.09 s | 0.85 s | 0.77 s |
+
+| One-time cost | Lazy | Eager |
+|---|---|---|
+| Memory page-locked | 704 MiB, in 11 blocks | 768 MiB, one arena |
+| Time page-locking | 0.19 to 0.21 s | 0.21 to 0.27 s |
+| Setup phase | 0.19 s | 0.27 to 0.34 s |
+
+What this shows:
+
+- **The total does not change.** Page-locking costs about 0.3 ms per MiB
+  whether it is done in one call or eleven, so one arena is not cheaper than
+  separate buffers. Eager allocation moves the cost; it does not remove it.
+- **The run phase loses it.** With eager allocation nothing is locked after
+  setup, and the 3-epoch run drops from 0.15 s to 0.086 s (lookahead) and
+  from 0.20 s to 0.11 s (LRU). At 30 epochs the same 0.07 to 0.08 s is less
+  than 10% of the run, which is inside the run-to-run variance, so no
+  difference is claimed there.
+- **Lazy allocation already paid most of it during setup** in this
+  benchmark: only the 3 or 4 layers that are first spilled during the first
+  epoch are locked inside the run.
+- **The cost is smaller than this README said.** The 29 ms per 64 MiB buffer
+  quoted earlier does not hold up when the allocation call is timed
+  directly: the median is about 18 ms per buffer (0.2 s for 704 MiB), though
+  single runs reached 0.35 s.
+
+Under a host limit the arena behaves like lazy allocation:
+`--lookahead --host-limit-mib 576` gives the same counters either way (4
+clean copies given up, 832 MiB copied to the host) and the same total (0.35 s
+lazy, 0.34 s eager).
 
 ## Limitations
 
@@ -186,9 +252,15 @@ released.
 - Single GPU, single thread, `f32` tensors only in the benchmark.
 - Copying a modified tensor back to the host is still synchronous, and so is
   rebuilding a reconstructible one; only reloads from the host are prefetched.
-- Page-locked buffers are allocated one tensor at a time, on first spill.
-  Allocating them up front, or from one arena, would move that cost out of
-  the run.
+- Page-locked host memory is unlocked only when the host limit needs the
+  room for a block of another size, or when the manager is dropped. There
+  is no call to give unused blocks back.
+- The eager arena needs a host limit, and with tensors of different sizes
+  it can fragment: a spill may give up clean copies while the arena still
+  has enough free bytes in total, just not in one piece. Not measured yet;
+  the benchmark's layers are all the same size.
+- Eager allocation moves page-locking into setup but does not make it
+  cheaper (about 0.3 ms per MiB either way).
 - A failed prefetch on the copy stream is reported by the next
   `ensure_resident` of that tensor, which leaves it spilled.
 
