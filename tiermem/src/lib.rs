@@ -11,25 +11,29 @@
 //! behaviour reproducible on any GPU and lets a 16 GB card stand in for a much
 //! smaller one.
 //!
-//! Spilled contents live in page-locked host memory and move on a CUDA stream
-//! of the manager's own, so a reload started with [`Manager::prefetch`] (or
+//! Spilled contents live in page-locked host memory, which is locked either
+//! as it is first needed or up front (see [`HostAlloc`]), and move on a CUDA
+//! stream of the manager's own, so a reload started with [`Manager::prefetch`] (or
 //! automatically, see [`Config::prefetch_depth`]) overlaps with kernels
 //! running on other streams.
 
 mod copy;
 mod error;
+mod host;
 mod trace;
 
 pub use error::{EntrySnapshot, Snapshot, TierError};
 pub use trace::{Event, EventKind, Trace};
 
-use copy::{LoadFromHost, PendingLoad, PinnedBuf, SpillToHost, Started};
+use copy::{LoadFromHost, PendingLoad, SpillToHost, Started};
 use cutile::cuda_async::device_context::{get_default_device, with_device};
 use cutile::cuda_core::Stream;
 use cutile::prelude::*;
+use host::{HostBlock, HostPool};
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
-use std::time::Instant;
+use std::marker::PhantomData;
+use std::time::{Duration, Instant};
 
 /// How expensive a tensor is to move off the device, in eviction order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -76,6 +80,20 @@ pub enum Policy {
     EvictLookahead,
 }
 
+/// When the host memory that spilled contents live in is page-locked.
+/// Locking is slow (about 0.3 ms per MiB on the development machine), and
+/// memory that has been locked is kept for reuse either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostAlloc {
+    /// Lock a block the first time a spill finds no free one. The cost lands
+    /// on the eviction that needs it.
+    Lazy,
+    /// Lock one arena of [`Config::host_limit_bytes`] when the first tensor
+    /// backed by a spill is registered, and serve every spill from it. The
+    /// cost is paid once, during setup, and the arena never grows.
+    Eager,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     /// Hard limit on bytes resident on the device.
@@ -86,11 +104,14 @@ pub struct Config {
     /// fallen to this level or below. Setting it equal to the soft limit
     /// fires on every crossing.
     pub pressure_rearm_bytes: usize,
-    /// Limit on host RAM held for spilled contents and clean copies. When a
-    /// spill would exceed it, clean copies of resident tensors are freed
-    /// first; if that is not enough the eviction fails with
+    /// Limit on the page-locked host RAM held for spilled contents and clean
+    /// copies. When a spill would exceed it, clean copies of resident tensors
+    /// are freed first; if that is not enough the eviction fails with
     /// [`TierError::HostBudgetExceeded`].
     pub host_limit_bytes: usize,
+    /// When that memory is page-locked. [`HostAlloc::Eager`] needs a host
+    /// limit, which is the size of its arena.
+    pub host_alloc: HostAlloc,
     /// After each [`Manager::ensure_resident`], start reloading up to this
     /// many of the next tensors declared with [`Manager::expect_accesses`].
     /// A prefetch never evicts a tensor that is declared to be used sooner
@@ -101,13 +122,15 @@ pub struct Config {
 
 impl Config {
     /// A config with the soft limit at 80% of the budget, pressure re-arming
-    /// at 60%, no host limit and no automatic prefetch.
+    /// at 60%, no host limit, host memory locked as it is needed, and no
+    /// automatic prefetch.
     pub fn new(budget_bytes: usize, policy: Policy) -> Self {
         Self {
             budget_bytes,
             soft_limit_bytes: budget_bytes / 5 * 4,
             pressure_rearm_bytes: budget_bytes / 5 * 3,
             host_limit_bytes: usize::MAX,
+            host_alloc: HostAlloc::Lazy,
             prefetch_depth: 0,
             policy,
         }
@@ -128,8 +151,13 @@ pub struct Stats {
     pub resident_bytes: usize,
     /// Bytes of evicted tensors whose contents live in host RAM.
     pub spilled_bytes: usize,
-    /// All host RAM held: spilled tensors plus clean copies of resident ones.
+    /// Host RAM holding contents: spilled tensors plus clean copies of
+    /// resident ones.
     pub host_bytes: usize,
+    /// Host RAM page-locked, whether or not it holds contents right now.
+    pub pinned_bytes: usize,
+    /// Total time spent page-locking host memory.
+    pub pin_time: Duration,
     pub peak_resident_bytes: usize,
     pub evictions: u64,
     /// Evictions that reused a clean host copy instead of copying to the host.
@@ -154,7 +182,7 @@ enum Location<T: DType> {
     /// A prefetch is copying the contents back; the device memory is already
     /// allocated and counted, and `clean_copy` holds the source.
     Loading(PendingLoad<T>),
-    Host(Arc<PinnedBuf<T>>),
+    Host(Arc<HostBlock>),
     /// Evicted with [`Backing::Reconstruct`]; nothing is kept.
     Dropped,
 }
@@ -168,7 +196,7 @@ struct Entry<T: DType> {
     /// For a resident tensor reloaded from the host: the contents it was
     /// reloaded from, still valid because nothing has written to it since.
     /// Evicting it again reuses this instead of copying back to the host.
-    clean_copy: Option<Arc<PinnedBuf<T>>>,
+    clean_copy: Option<Arc<HostBlock>>,
     last_use: u64,
 }
 
@@ -219,6 +247,9 @@ pub struct Manager<T: DType> {
     in_use: Vec<TensorId>,
     /// Created on first use, so a manager that never migrates needs no stream.
     copy_stream: Option<Arc<Stream>>,
+    host_pool: HostPool,
+    /// The eager arena has been page-locked.
+    host_reserved: bool,
     stats: Stats,
     pressure_armed: bool,
     on_pressure: Option<Box<dyn FnMut(Pressure)>>,
@@ -235,6 +266,10 @@ impl<T: DType> Manager<T> {
             config.pressure_rearm_bytes <= config.soft_limit_bytes,
             "pressure re-arm level must not exceed the soft limit"
         );
+        assert!(
+            config.host_alloc == HostAlloc::Lazy || config.host_limit_bytes != usize::MAX,
+            "eager host allocation needs a host limit to size the arena"
+        );
         Self {
             config,
             entries: HashMap::new(),
@@ -243,6 +278,8 @@ impl<T: DType> Manager<T> {
             expected: VecDeque::new(),
             in_use: Vec::new(),
             copy_stream: None,
+            host_pool: HostPool::new(config.host_limit_bytes),
+            host_reserved: false,
             stats: Stats::default(),
             pressure_armed: true,
             on_pressure: None,
@@ -286,6 +323,9 @@ impl<T: DType> Manager<T> {
     ) -> Result<TensorId, TierError> {
         let bytes = tensor.num_bytes();
         let start = self.trace.now();
+        if matches!(backing, Backing::Spill) {
+            self.reserve_host()?;
+        }
         self.make_room(bytes, &[])?;
         let id = TensorId(self.next_id);
         self.next_id += 1;
@@ -447,7 +487,11 @@ impl<T: DType> Manager<T> {
     }
 
     pub fn stats(&self) -> Stats {
-        self.stats
+        Stats {
+            pinned_bytes: self.host_pool.pinned_bytes(),
+            pin_time: self.host_pool.pin_time(),
+            ..self.stats
+        }
     }
 
     pub fn trace(&self) -> &Trace {
@@ -550,13 +594,28 @@ impl<T: DType> Manager<T> {
         Ok(stream)
     }
 
-    /// Gives up clean copies of resident tensors, least recently used first,
-    /// until `bytes` more fit under the host limit. Returns their buffers:
-    /// page-locking memory is slow, so the caller reuses one if it can.
-    fn make_host_room(&mut self, bytes: usize) -> Result<Vec<PinnedBuf<T>>, TierError> {
-        let limit = self.config.host_limit_bytes;
-        let mut freed = Vec::new();
-        while self.stats.host_bytes.saturating_add(bytes) > limit {
+    /// Page-locks the eager arena, once.
+    fn reserve_host(&mut self) -> Result<(), TierError> {
+        if self.config.host_alloc == HostAlloc::Eager && !self.host_reserved {
+            let stream = self.copy_stream()?;
+            self.host_pool
+                .reserve(stream.device(), self.config.host_limit_bytes)
+                .map_err(dev)?;
+            self.host_reserved = true;
+        }
+        Ok(())
+    }
+
+    /// A host block for spilling `bytes`. If the pool has no room, clean
+    /// copies of resident tensors are given up, least recently used first,
+    /// until it does.
+    fn alloc_host(&mut self, bytes: usize, stream: &Arc<Stream>) -> Result<HostBlock, TierError> {
+        let grow = self.config.host_alloc == HostAlloc::Lazy;
+        loop {
+            let block = self.host_pool.alloc(stream.device(), bytes, grow);
+            if let Some(block) = block.map_err(dev)? {
+                return Ok(block);
+            }
             let victim = self
                 .entries
                 .values_mut()
@@ -566,16 +625,15 @@ impl<T: DType> Manager<T> {
                 return Err(TierError::HostBudgetExceeded {
                     requested_bytes: bytes,
                     host_bytes: self.stats.host_bytes,
-                    host_limit_bytes: limit,
+                    host_limit_bytes: self.config.host_limit_bytes,
                 });
             };
             // Only an in-flight load shares a clean copy, and loading tensors
-            // are not candidates, so this never fails to unwrap.
-            freed.extend(entry.clean_copy.take().and_then(Arc::into_inner));
+            // are not candidates, so this returns the block to the pool.
+            entry.clean_copy = None;
             self.stats.host_bytes -= entry.bytes;
             self.stats.clean_copies_dropped += 1;
         }
-        Ok(freed)
     }
 
     fn evict(&mut self, id: TensorId) -> Result<(), TierError> {
@@ -585,14 +643,9 @@ impl<T: DType> Manager<T> {
         // Everything that can fail without losing the contents happens before
         // the tensor is taken off the device.
         let fresh_host = match (&entry.location, &entry.backing, &entry.clean_copy) {
-            (Location::Device(tensor), Backing::Spill, None) => {
-                let len = tensor.size();
-                let mut spare = self.make_host_room(bytes)?;
+            (Location::Device(_), Backing::Spill, None) => {
                 let stream = self.copy_stream()?;
-                let host = match spare.iter().position(|buf| buf.len() == len) {
-                    Some(i) => spare.swap_remove(i),
-                    None => PinnedBuf::uninit(stream.device(), len).map_err(dev)?,
-                };
+                let host = self.alloc_host(bytes, &stream)?;
                 Some((stream, host))
             }
             _ => None,
@@ -675,10 +728,13 @@ impl<T: DType> Manager<T> {
         let bytes = entry.bytes;
         let tensor = match (&entry.location, &entry.backing) {
             (Location::Device(_) | Location::Loading(_), _) => return Ok(()),
-            (Location::Host(host), _) => (LoadFromHost { host: host.clone() })
-                .sync_on(stream.as_ref().unwrap())
-                .map_err(dev)?
-                .reshape(&entry.shape)?,
+            (Location::Host(host), _) => (LoadFromHost {
+                host: host.clone(),
+                dtype: PhantomData,
+            })
+            .sync_on(stream.as_ref().unwrap())
+            .map_err(dev)?
+            .reshape(&entry.shape)?,
             (Location::Dropped, Backing::Reconstruct(rebuild)) => rebuild()?,
             (Location::Dropped, Backing::Spill) => {
                 unreachable!("spilled tensors are kept on the host")

@@ -4,7 +4,8 @@ use cutile::api;
 use cutile::prelude::*;
 use std::cell::Cell;
 use std::rc::Rc;
-use tiermem::{Config, Hint, Manager, Policy, TierError};
+use std::time::Duration;
+use tiermem::{Config, Hint, HostAlloc, Manager, Policy, TierError};
 
 const N: usize = 1024;
 const BYTES: usize = N * size_of::<f32>();
@@ -562,4 +563,128 @@ fn waiting_for_an_in_flight_prefetch_yields_the_contents() {
     );
     assert!(contents(&mut m, a).iter().all(|&v| v == 7.0));
     assert_eq!(m.stats().reloads, 1);
+}
+
+#[test]
+fn lazy_pins_on_first_spill_and_reuses_freed_blocks() {
+    let mut m = manager(Policy::EvictLru);
+    assert_eq!(
+        m.stats().pinned_bytes,
+        0,
+        "nothing is pinned before a spill"
+    );
+    let [a, _, c, d] = reloaded_spill(&mut m);
+    let s = m.stats();
+    assert_eq!(s.pinned_bytes, 2 * BYTES, "a's clean copy plus spilled b");
+    assert!(s.pin_time > Duration::ZERO);
+
+    // Writing to a gives up its clean copy; the block stays page-locked.
+    *m.tensor_mut(a).unwrap() = tensor(9.0);
+    assert_eq!(m.stats().host_bytes, BYTES);
+    assert_eq!(m.stats().pinned_bytes, 2 * BYTES);
+
+    // The next spill reuses that block instead of page-locking a new one.
+    m.ensure_resident(&[a, d]).unwrap();
+    m.register(tensor(4.0), Hint::Evictable).unwrap();
+    assert!(!m.is_resident(c));
+    let s = m.stats();
+    assert_eq!(s.host_bytes, 2 * BYTES);
+    assert_eq!(s.pinned_bytes, 2 * BYTES, "no new page-locked memory");
+    assert!(contents(&mut m, c).iter().all(|&v| v == 2.0));
+}
+
+#[test]
+fn eager_arena_is_pinned_once_at_the_first_registration() {
+    let mut m = Manager::new(Config {
+        host_alloc: HostAlloc::Eager,
+        host_limit_bytes: 4 * BYTES,
+        ..Config::new(3 * BYTES, Policy::EvictLru)
+    });
+    assert_eq!(
+        m.stats().pinned_bytes,
+        0,
+        "the manager has not touched the device"
+    );
+    let first = m.register(tensor(7.0), Hint::Evictable).unwrap();
+    let pinned = m.stats();
+    assert_eq!(pinned.pinned_bytes, 4 * BYTES, "the whole arena, up front");
+    assert!(pinned.pin_time > Duration::ZERO);
+
+    let rest = [1.0, 2.0, 3.0].map(|v| m.register(tensor(v), Hint::Evictable).unwrap());
+    assert!(!m.is_resident(first));
+    for (id, v) in [(first, 7.0), (rest[0], 1.0), (rest[1], 2.0), (rest[2], 3.0)] {
+        m.ensure_resident(&[id]).unwrap();
+        let host = m.tensor(id).unwrap().dup().sync().unwrap();
+        assert!(host.to_host_vec().sync().unwrap().iter().all(|&x| x == v));
+    }
+    let s = m.stats();
+    assert!(s.evictions >= 4);
+    assert_eq!(
+        s.pinned_bytes,
+        4 * BYTES,
+        "spills are served from the arena"
+    );
+    assert_eq!(s.pin_time, pinned.pin_time, "nothing was page-locked later");
+}
+
+#[test]
+fn eager_arena_is_the_host_limit() {
+    let mut m = Manager::new(Config {
+        host_alloc: HostAlloc::Eager,
+        host_limit_bytes: 2 * BYTES,
+        ..Config::new(3 * BYTES, Policy::EvictLru)
+    });
+    let [a, b, c, d] = reloaded_spill(&mut m);
+    // The arena holds a's clean copy and spilled b; reloading b spills c,
+    // which takes over the block of a's clean copy.
+    m.ensure_resident(&[b]).unwrap();
+    assert!(!m.is_resident(c));
+    assert_eq!(m.stats().clean_copies_dropped, 1);
+    m.ensure_resident(&[c]).unwrap();
+    m.ensure_resident(&[d]).unwrap();
+    let e = m.register(tensor(9.0), Hint::Evictable).unwrap();
+    let err = m.register(tensor(9.0), Hint::Evictable).unwrap_err();
+    assert!(matches!(err, TierError::HostBudgetExceeded { .. }), "{err}");
+    assert_eq!(m.stats().pinned_bytes, 2 * BYTES, "the arena never grows");
+    m.unregister(e).unwrap();
+    for (id, v) in [(a, 7.0), (b, 1.0), (c, 2.0), (d, 3.0)] {
+        assert!(contents(&mut m, id).iter().all(|&x| x == v), "tensor {v}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "host limit")]
+fn eager_allocation_needs_a_host_limit() {
+    let _ = Manager::<f32>::new(Config {
+        host_alloc: HostAlloc::Eager,
+        ..Config::new(3 * BYTES, Policy::EvictLru)
+    });
+}
+
+#[test]
+fn lazy_unpins_unused_blocks_when_the_host_limit_needs_the_room() {
+    let mut m = Manager::new(Config {
+        host_limit_bytes: 2 * BYTES,
+        ..Config::new(3 * BYTES, Policy::EvictLru)
+    });
+    let [s1, s2, s3, s4] =
+        [0.0, 1.0, 2.0, 3.0].map(|v| m.register(tensor(v), Hint::Evictable).unwrap());
+    assert!(!m.is_resident(s1));
+    // s1's block stays page-locked but unused; it is too small for `big`.
+    for id in [s1, s2, s3] {
+        m.unregister(id).unwrap();
+    }
+    assert_eq!(m.stats().pinned_bytes, BYTES);
+    let big = m
+        .register(api::full(5.0f32, &[2 * N]).sync().unwrap(), Hint::Evictable)
+        .unwrap();
+    m.ensure_resident(&[s4]).unwrap(); // big is now least recent
+    let last = m.register(tensor(6.0), Hint::Evictable).unwrap();
+    assert!(!m.is_resident(big));
+    let s = m.stats();
+    assert_eq!(s.host_bytes, 2 * BYTES);
+    assert_eq!(s.pinned_bytes, 2 * BYTES, "the unused block was unpinned");
+    // Reloading big must not need to spill anything: the host is full.
+    m.unregister(last).unwrap();
+    assert!(contents(&mut m, big).iter().all(|&v| v == 5.0));
 }
