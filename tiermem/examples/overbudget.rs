@@ -213,8 +213,10 @@ struct Outcome {
 }
 
 /// Runs the whole workload once with a fresh manager: registers the layers,
-/// sweeps them for the configured epochs and checks the result.
-fn run_once(args: &Args, trace: Option<&str>) -> Result<Outcome, Box<dyn std::error::Error>> {
+/// sweeps them for the configured epochs and checks the result. The trace,
+/// if one was asked for, is written when `write_trace` is set and also
+/// whenever the run fails, since a failed run is the last one.
+fn run_once(args: &Args, write_trace: bool) -> Result<Outcome, Box<dyn std::error::Error>> {
     let len = args.layer_mib * MIB / size_of::<f32>();
     let policy = match args.mode {
         Mode::Strict => Policy::Strict,
@@ -292,7 +294,11 @@ fn run_once(args: &Args, trace: Option<&str>) -> Result<Outcome, Box<dyn std::er
             .count();
     }
     times.total = start.elapsed();
-    if let Some(path) = trace {
+    if let Some(path) = args
+        .trace
+        .as_deref()
+        .filter(|_| write_trace || failure.is_some())
+    {
         mgr.trace().write_chrome_trace(path)?;
     }
     Ok(Outcome {
@@ -304,6 +310,31 @@ fn run_once(args: &Args, trace: Option<&str>) -> Result<Outcome, Box<dyn std::er
         elements,
         expected,
     })
+}
+
+/// The warmup run and the measured runs, in order. The warmup is left out
+/// unless it failed, and nothing runs after a failure: a workload that
+/// cannot be admitted would only fail the same way again.
+fn run_all(args: &Args) -> Result<Vec<Outcome>, Box<dyn std::error::Error>> {
+    let warmup = run_once(args, false)?;
+    if warmup.failure.is_some() {
+        return Ok(vec![warmup]);
+    }
+    let mut outcomes = Vec::with_capacity(args.runs);
+    for run in 1..=args.runs {
+        let outcome = run_once(args, run == args.runs)?;
+        let failed = outcome.failure.is_some();
+        outcomes.push(outcome);
+        if failed {
+            break;
+        }
+    }
+    Ok(outcomes)
+}
+
+/// The first run that could not admit its layers, if any.
+fn first_failure(outcomes: &[Outcome]) -> Option<&Outcome> {
+    outcomes.iter().find(|outcome| outcome.failure.is_some())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -350,21 +381,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         kernel::add((&mut out).partition([TILE]), &x, &x).sync()?;
     }
 
-    // The warmup run is not reported, unless it shows that the workload
-    // cannot run at all, in which case repeating it would tell nothing more.
-    let warmup = run_once(&args, None)?;
-    if let Some(failure) = &warmup.failure {
-        println!("{failure}");
-        println!("time            {:.3} s", warmup.times.total.as_secs_f64());
-        print_counters(&args, &warmup);
+    let outcomes = run_all(&args)?;
+    if let Some(failed) = first_failure(&outcomes) {
+        println!("{}", failed.failure.as_deref().unwrap_or_default());
+        println!("time            {:.3} s", failed.times.total.as_secs_f64());
+        print_counters(&args, failed);
         std::process::exit(1);
     }
 
-    let mut outcomes = Vec::with_capacity(args.runs);
-    for run in 1..=args.runs {
-        let trace = args.trace.as_deref().filter(|_| run == args.runs);
-        outcomes.push(run_once(&args, trace)?);
-    }
     let last = outcomes.last().unwrap();
     let wrong = outcomes.iter().filter(|o| o.errors > 0).count();
     if wrong == 0 {
@@ -518,6 +542,67 @@ mod tests {
     fn the_summary_of_an_even_number_of_runs_averages_the_middle_two() {
         let summary = Summary::of(&ms(&[40, 10, 30, 20]));
         assert_eq!(summary.median, Duration::from_millis(25));
+    }
+
+    /// Four 1 MiB layers under a strict 2 MiB budget: the third cannot be
+    /// admitted.
+    fn tiny_strict(trace: &std::path::Path) -> Args {
+        args(&[
+            "strict",
+            "--layers",
+            "4",
+            "--layer-mib",
+            "1",
+            "--budget-mib",
+            "2",
+            "--trace",
+            trace.to_str().unwrap(),
+        ])
+    }
+
+    fn outcome(failure: Option<&str>) -> Outcome {
+        Outcome {
+            times: Times::default(),
+            stats: Stats::default(),
+            pressure_events: 0,
+            failure: failure.map(String::from),
+            errors: 0,
+            elements: 0,
+            expected: 0.0,
+        }
+    }
+
+    #[test]
+    fn a_run_that_fails_writes_its_trace_without_being_the_last() {
+        let path = std::env::temp_dir().join(format!("overbudget-{}-a.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let outcome = run_once(&tiny_strict(&path), false).unwrap();
+        assert!(outcome.failure.is_some());
+        assert!(path.exists(), "the trace the output names was written");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn measuring_stops_at_a_warmup_that_fails() {
+        let path = std::env::temp_dir().join(format!("overbudget-{}-b.json", std::process::id()));
+        let outcomes = run_all(&tiny_strict(&path)).unwrap();
+        assert_eq!(outcomes.len(), 1, "the workload is not repeated");
+        assert!(first_failure(&outcomes).is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_failure_in_any_measured_run_is_reported() {
+        assert!(first_failure(&[outcome(None), outcome(None)]).is_none());
+        let runs = [
+            outcome(None),
+            outcome(Some("FAILED admitting layer 2")),
+            outcome(None),
+        ];
+        assert_eq!(
+            first_failure(&runs).and_then(|o| o.failure.as_deref()),
+            Some("FAILED admitting layer 2")
+        );
     }
 
     #[test]
