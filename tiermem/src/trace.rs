@@ -18,7 +18,11 @@ pub enum EventKind {
         /// was reused.
         copied: bool,
     },
+    /// A reload awaited by the caller. For a prefetched tensor this covers
+    /// only the wait for what was left of the copy.
     Reload,
+    /// A reload submitted to the copy stream without waiting.
+    Prefetch,
     Reconstruct,
     Pressure,
     /// Resident bytes after a change; `bytes` holds the new total.
@@ -40,6 +44,7 @@ impl EventKind {
             } => "evict_clean",
             EventKind::Evict { spilled: false, .. } => "evict_drop",
             EventKind::Reload => "reload",
+            EventKind::Prefetch => "prefetch",
             EventKind::Reconstruct => "reconstruct",
             EventKind::Pressure => "pressure",
             EventKind::Resident => "resident_bytes",

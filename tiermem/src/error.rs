@@ -11,6 +11,13 @@ pub enum TierError {
         could_evict: bool,
         snapshot: Snapshot,
     },
+    /// Recoverable: spilling a tensor would exceed the host RAM limit and no
+    /// clean copy is left to free. The tensor is still on the device.
+    HostBudgetExceeded {
+        requested_bytes: usize,
+        host_bytes: usize,
+        host_limit_bytes: usize,
+    },
     UnknownTensor(TensorId),
     NotResident(TensorId),
     /// Not recoverable by the manager: a CUDA or cutile operation failed.
@@ -21,7 +28,10 @@ impl TierError {
     /// Whether the caller can retry after freeing memory or changing policy,
     /// as opposed to a device failure.
     pub fn is_recoverable(&self) -> bool {
-        matches!(self, TierError::BudgetExceeded { .. })
+        matches!(
+            self,
+            TierError::BudgetExceeded { .. } | TierError::HostBudgetExceeded { .. }
+        )
     }
 }
 
@@ -51,6 +61,17 @@ impl fmt::Display for TierError {
                 }
                 write!(f, "\n{snapshot}")
             }
+            TierError::HostBudgetExceeded {
+                requested_bytes,
+                host_bytes,
+                host_limit_bytes,
+            } => write!(
+                f,
+                "host budget exceeded: spilling {} with {} of {} held",
+                mib(*requested_bytes),
+                mib(*host_bytes),
+                mib(*host_limit_bytes),
+            ),
             TierError::UnknownTensor(id) => write!(f, "unknown tensor {id:?}"),
             TierError::NotResident(id) => {
                 write!(

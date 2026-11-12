@@ -2,7 +2,8 @@
 //! through a kernel, the way inference walks a model's layers.
 //!
 //!   cargo run --release -p tiermem --example overbudget -- [MODE] [--lookahead]
-//!       [--budget-mib N] [--layers N] [--layer-mib N] [--epochs N] [--trace PATH]
+//!       [--prefetch N] [--host-limit-mib N] [--work N] [--budget-mib N]
+//!       [--layers N] [--layer-mib N] [--epochs N] [--trace PATH]
 //!
 //! MODE is one of:
 //!   strict       no eviction: behaves like a GPU with only --budget-mib of memory
@@ -11,6 +12,11 @@
 //!
 //! --lookahead declares the layer order up front and evicts the layer needed
 //! farthest in the future instead of the least recently used one.
+//! --prefetch N also starts reloading the next N declared layers while the
+//! current one is being computed on (needs --lookahead).
+//! --host-limit-mib N caps the host RAM held for spilled layers.
+//! --work N runs the kernel N times per layer, standing in for a heavier
+//! layer; this is the compute a prefetch can overlap with.
 //!
 //! The two accumulator buffers are not managed and sit outside the budget.
 
@@ -51,6 +57,9 @@ enum Mode {
 struct Args {
     mode: Mode,
     lookahead: bool,
+    prefetch: usize,
+    host_limit_mib: Option<usize>,
+    work: usize,
     budget_mib: usize,
     layers: usize,
     layer_mib: usize,
@@ -62,6 +71,9 @@ fn parse_args() -> Args {
     let mut args = Args {
         mode: Mode::Spill,
         lookahead: false,
+        prefetch: 0,
+        host_limit_mib: None,
+        work: 1,
         budget_mib: 256,
         layers: 12,
         layer_mib: 64,
@@ -80,6 +92,9 @@ fn parse_args() -> Args {
             "spill" => args.mode = Mode::Spill,
             "rebuild" => args.mode = Mode::Rebuild,
             "--lookahead" => args.lookahead = true,
+            "--prefetch" => args.prefetch = num("--prefetch"),
+            "--host-limit-mib" => args.host_limit_mib = Some(num("--host-limit-mib")),
+            "--work" => args.work = num("--work"),
             "--budget-mib" => args.budget_mib = num("--budget-mib"),
             "--layers" => args.layers = num("--layers"),
             "--layer-mib" => args.layer_mib = num("--layer-mib"),
@@ -88,6 +103,10 @@ fn parse_args() -> Args {
             other => panic!("unknown argument {other:?}"),
         }
     }
+    assert!(
+        args.prefetch == 0 || args.lookahead,
+        "--prefetch needs --lookahead"
+    );
     args
 }
 
@@ -104,19 +123,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Spill | Mode::Rebuild if args.lookahead => Policy::EvictLookahead,
         Mode::Spill | Mode::Rebuild => Policy::EvictLru,
     };
-    let mut mgr = Manager::<f32>::new(Config::new(args.budget_mib * MIB, policy));
+    let mut mgr = Manager::<f32>::new(Config {
+        prefetch_depth: args.prefetch,
+        host_limit_bytes: args.host_limit_mib.map_or(usize::MAX, |mib| mib * MIB),
+        ..Config::new(args.budget_mib * MIB, policy)
+    });
     let pressure_events = Rc::new(Cell::new(0u32));
     let counter = pressure_events.clone();
     mgr.on_pressure(move |_| counter.set(counter.get() + 1));
 
     println!(
-        "mode={}{} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
+        "mode={}{}{} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
         match args.mode {
             Mode::Strict => "strict",
             Mode::Spill => "spill",
             Mode::Rebuild => "rebuild",
         },
         if args.lookahead { " lookahead" } else { "" },
+        if args.prefetch > 0 {
+            format!(" prefetch={}", args.prefetch)
+        } else {
+            String::new()
+        },
         args.budget_mib,
         args.layers * args.layer_mib,
         args.layers,
@@ -165,13 +193,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..args.epochs {
         for &id in &layers {
             mgr.ensure_resident(&[id])?;
-            kernel::add((&mut out).partition([TILE]), &acc, mgr.tensor(id)?).sync()?;
-            std::mem::swap(&mut acc, &mut out);
+            for _ in 0..args.work {
+                kernel::add((&mut out).partition([TILE]), &acc, mgr.tensor(id)?).sync()?;
+                std::mem::swap(&mut acc, &mut out);
+            }
         }
     }
 
     let n = args.layers as f32;
-    let expected = args.epochs as f32 * n * (n + 1.0) / 2.0;
+    let expected = (args.epochs * args.work) as f32 * n * (n + 1.0) / 2.0;
     let host = acc.to_host_vec().sync()?;
     let errors = host
         .iter()
@@ -203,13 +233,21 @@ fn finish(
         s.clean_evictions
     );
     println!("reloads         {}", s.reloads);
+    println!(
+        "prefetches      {} ({} cancelled)",
+        s.prefetches, s.prefetches_cancelled
+    );
     println!("reconstructions {}", s.reconstructions);
     println!(
         "moved           {moved_mib:.0} MiB (to host {} + to device {})",
         s.bytes_to_host / MIB as u64,
         s.bytes_to_device / MIB as u64
     );
-    println!("host RAM held   {} MiB", s.host_bytes / MIB);
+    println!(
+        "host RAM held   {} MiB ({} clean copies dropped)",
+        s.host_bytes / MIB,
+        s.clean_copies_dropped
+    );
     println!("pressure events {pressure_events}");
     if let Some(path) = &args.trace {
         mgr.trace().write_chrome_trace(path)?;
