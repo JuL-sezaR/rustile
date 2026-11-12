@@ -2,8 +2,9 @@
 //! through a kernel, the way inference walks a model's layers.
 //!
 //!   cargo run --release -p tiermem --example overbudget -- [MODE] [--lookahead]
-//!       [--prefetch N] [--host-limit-mib N] [--work N] [--budget-mib N]
-//!       [--layers N] [--layer-mib N] [--epochs N] [--trace PATH]
+//!       [--prefetch N] [--host-limit-mib N] [--host-alloc lazy|eager]
+//!       [--work N] [--budget-mib N] [--layers N] [--layer-mib N]
+//!       [--epochs N] [--trace PATH]
 //!
 //! MODE is one of:
 //!   strict       no eviction: behaves like a GPU with only --budget-mib of memory
@@ -15,18 +16,26 @@
 //! --prefetch N also starts reloading the next N declared layers while the
 //! current one is being computed on (needs --lookahead).
 //! --host-limit-mib N caps the host RAM held for spilled layers.
+//! --host-alloc eager page-locks that much host RAM once, before the layers
+//! are registered, instead of a block per layer as each is first spilled
+//! (lazy, the default). Without --host-limit-mib the arena is as large as the
+//! working set.
 //! --work N runs the kernel N times per layer, standing in for a heavier
 //! layer; this is the compute a prefetch can overlap with.
 //!
 //! The two accumulator buffers are not managed and sit outside the budget.
+//!
+//! The reported time is split into setup (creating and registering the
+//! layers, which already spills the ones that do not fit), run (the epochs)
+//! and the final check of the result.
 
 use cutile::api;
 use cutile::prelude::*;
 use cutile::tensor::PartitionMut;
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Instant;
-use tiermem::{Config, Hint, Manager, Policy, TensorId};
+use std::time::{Duration, Instant};
+use tiermem::{Config, Hint, HostAlloc, Manager, Policy, TensorId};
 
 #[cutile::module]
 mod kernel {
@@ -59,6 +68,7 @@ struct Args {
     lookahead: bool,
     prefetch: usize,
     host_limit_mib: Option<usize>,
+    host_alloc: HostAlloc,
     work: usize,
     budget_mib: usize,
     layers: usize,
@@ -73,6 +83,7 @@ fn parse_args() -> Args {
         lookahead: false,
         prefetch: 0,
         host_limit_mib: None,
+        host_alloc: HostAlloc::Lazy,
         work: 1,
         budget_mib: 256,
         layers: 12,
@@ -94,6 +105,13 @@ fn parse_args() -> Args {
             "--lookahead" => args.lookahead = true,
             "--prefetch" => args.prefetch = num("--prefetch"),
             "--host-limit-mib" => args.host_limit_mib = Some(num("--host-limit-mib")),
+            "--host-alloc" => {
+                args.host_alloc = match it.next().as_deref() {
+                    Some("lazy") => HostAlloc::Lazy,
+                    Some("eager") => HostAlloc::Eager,
+                    other => panic!("--host-alloc needs lazy or eager, got {other:?}"),
+                }
+            }
             "--work" => args.work = num("--work"),
             "--budget-mib" => args.budget_mib = num("--budget-mib"),
             "--layers" => args.layers = num("--layers"),
@@ -107,6 +125,9 @@ fn parse_args() -> Args {
         args.prefetch == 0 || args.lookahead,
         "--prefetch needs --lookahead"
     );
+    if args.host_alloc == HostAlloc::Eager && args.host_limit_mib.is_none() {
+        args.host_limit_mib = Some(args.layers * args.layer_mib);
+    }
     args
 }
 
@@ -126,6 +147,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut mgr = Manager::<f32>::new(Config {
         prefetch_depth: args.prefetch,
         host_limit_bytes: args.host_limit_mib.map_or(usize::MAX, |mib| mib * MIB),
+        host_alloc: args.host_alloc,
         ..Config::new(args.budget_mib * MIB, policy)
     });
     let pressure_events = Rc::new(Cell::new(0u32));
@@ -133,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mgr.on_pressure(move |_| counter.set(counter.get() + 1));
 
     println!(
-        "mode={}{}{} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
+        "mode={}{}{}{} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
         match args.mode {
             Mode::Strict => "strict",
             Mode::Spill => "spill",
@@ -144,6 +166,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!(" prefetch={}", args.prefetch)
         } else {
             String::new()
+        },
+        match args.host_alloc {
+            HostAlloc::Lazy => "",
+            HostAlloc::Eager => " host-alloc=eager",
         },
         args.budget_mib,
         args.layers * args.layer_mib,
@@ -178,7 +204,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     e.is_recoverable()
                 );
                 println!("{e}");
-                return finish(&mgr, &args, start, pressure_events.get(), false);
+                let times = Times {
+                    total: start.elapsed(),
+                    ..Times::default()
+                };
+                return finish(&mgr, &args, times, pressure_events.get(), false);
             }
         }
     }
@@ -190,6 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             mgr.expect_accesses(&layers)?;
         }
     }
+    let setup = start.elapsed();
     for _ in 0..args.epochs {
         for &id in &layers {
             mgr.ensure_resident(&[id])?;
@@ -199,6 +230,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Every kernel was waited for, so the epochs are finished here.
+    let run = start.elapsed() - setup;
 
     let n = args.layers as f32;
     let expected = (args.epochs * args.work) as f32 * n * (n + 1.0) / 2.0;
@@ -212,20 +246,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("WRONG: {errors} of {} elements != {expected}", host.len());
     }
-    finish(&mgr, &args, start, pressure_events.get(), errors == 0)
+    let times = Times {
+        total: start.elapsed(),
+        setup,
+        run,
+    };
+    finish(&mgr, &args, times, pressure_events.get(), errors == 0)
+}
+
+#[derive(Default)]
+struct Times {
+    total: Duration,
+    /// Creating and registering the layers.
+    setup: Duration,
+    /// The epochs, without the final check.
+    run: Duration,
 }
 
 fn finish(
     mgr: &Manager<f32>,
     args: &Args,
-    start: Instant,
+    times: Times,
     pressure_events: u32,
     ok: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let elapsed = start.elapsed();
     let s = mgr.stats();
     let moved_mib = (s.bytes_to_host + s.bytes_to_device) as f64 / MIB as f64;
-    println!("time            {:.3} s", elapsed.as_secs_f64());
+    println!("time            {:.3} s", times.total.as_secs_f64());
+    println!("  setup         {:.3} s", times.setup.as_secs_f64());
+    println!("  run           {:.3} s", times.run.as_secs_f64());
+    println!(
+        "page-locking    {:.3} s for {} MiB ({})",
+        s.pin_time.as_secs_f64(),
+        s.pinned_bytes / MIB,
+        match args.host_alloc {
+            HostAlloc::Lazy => "as first spilled",
+            HostAlloc::Eager => "one arena, up front",
+        }
+    );
     println!("peak resident   {} MiB", s.peak_resident_bytes / MIB);
     println!("evictions       {}", s.evictions);
     println!(
