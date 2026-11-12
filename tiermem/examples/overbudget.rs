@@ -3,7 +3,7 @@
 //!
 //!   cargo run --release -p tiermem --example overbudget -- [MODE] [--lookahead]
 //!       [--prefetch N] [--host-limit-mib N] [--host-alloc lazy|eager]
-//!       [--work N] [--budget-mib N] [--layers N] [--layer-mib N]
+//!       [--work N] [--dirty] [--budget-mib N] [--layers N] [--layer-mib N]
 //!       [--epochs N] [--trace PATH]
 //!
 //! MODE is one of:
@@ -22,6 +22,11 @@
 //! working set.
 //! --work N runs the kernel N times per layer, standing in for a heavier
 //! layer; this is the compute a prefetch can overlap with.
+//!
+//! --dirty marks each layer as written after it is used, the way a training
+//! step updates its weights, so every eviction has to copy it back to the
+//! host. The contents are not actually changed, which keeps the final check
+//! the same.
 //!
 //! The two accumulator buffers are not managed and sit outside the budget.
 //!
@@ -70,6 +75,7 @@ struct Args {
     host_limit_mib: Option<usize>,
     host_alloc: HostAlloc,
     work: usize,
+    dirty: bool,
     budget_mib: usize,
     layers: usize,
     layer_mib: usize,
@@ -85,6 +91,7 @@ fn parse_args() -> Args {
         host_limit_mib: None,
         host_alloc: HostAlloc::Lazy,
         work: 1,
+        dirty: false,
         budget_mib: 256,
         layers: 12,
         layer_mib: 64,
@@ -113,6 +120,7 @@ fn parse_args() -> Args {
                 }
             }
             "--work" => args.work = num("--work"),
+            "--dirty" => args.dirty = true,
             "--budget-mib" => args.budget_mib = num("--budget-mib"),
             "--layers" => args.layers = num("--layers"),
             "--layer-mib" => args.layer_mib = num("--layer-mib"),
@@ -155,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     mgr.on_pressure(move |_| counter.set(counter.get() + 1));
 
     println!(
-        "mode={}{}{}{} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
+        "mode={}{}{}{}{} budget={} MiB working set={} MiB ({} x {} MiB) epochs={}",
         match args.mode {
             Mode::Strict => "strict",
             Mode::Spill => "spill",
@@ -171,6 +179,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             HostAlloc::Lazy => "",
             HostAlloc::Eager => " host-alloc=eager",
         },
+        if args.dirty { " dirty" } else { "" },
         args.budget_mib,
         args.layers * args.layer_mib,
         args.layers,
@@ -227,6 +236,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for _ in 0..args.work {
                 kernel::add((&mut out).partition([TILE]), &acc, mgr.tensor(id)?).sync()?;
                 std::mem::swap(&mut acc, &mut out);
+            }
+            if args.dirty {
+                mgr.tensor_mut(id)?;
             }
         }
     }
