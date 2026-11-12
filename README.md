@@ -189,22 +189,30 @@ was measured before a freed buffer was reused for the next spill, and the
 text was not updated when that changed.) 576 MiB
 is the minimum here, the 512 MiB that cannot be on the device plus one layer,
 because a victim is spilled before the incoming layer's host copy can be
-released.
+released. With `--prefetch 1` added, the same limit passes in 0.31 s, with
+576 MiB copied to the host and no clean copy given up.
 
 ## Host memory pool
 
 Page-locked host memory now comes from a pool (`tiermem/src/host.rs`) instead
 of one driver allocation per tensor. A block that is given back, because its
 tensor was written to, unregistered, or lost its clean copy to the host
-limit, goes on a free list and serves a later spill without being locked
-again. The pool hands out bytes, so tensors of any element type can share it.
+limit, serves a later spill without being locked again. The pool hands out
+bytes, packed without padding, so tensors of any element type and size can
+share it and the host limit counts exactly the bytes held.
 
 `Config::host_alloc` chooses when the memory is locked:
 
 - `HostAlloc::Lazy` (the default) locks a block the first time a spill finds
-  no free one, as before.
+  no free one of its size, as before. Each block is locked on its own, so
+  blocks of different sizes never leave unusable gaps; an unused block of
+  another size is unlocked when the host limit needs its room.
 - `HostAlloc::Eager` locks one arena of `Config::host_limit_bytes` when the
-  first spillable tensor is registered, and never grows it.
+  first spillable tensor is registered, and never grows it. If its free space
+  ends up in pieces too small for a spill, the blocks are moved together.
+
+In both modes a spill fails with `HostBudgetExceeded` only when the bytes
+held plus the bytes asked for exceed the limit.
 
 `Stats::pinned_bytes` and `Stats::pin_time` report what was locked and how
 long it took. The benchmark now splits its time into setup (creating and
@@ -263,11 +271,17 @@ waited for the copy. Three changes:
   finishes: evicting it, unregistering it or calling `tensor_mut` waits for
   what is left, and writing to it then discards the copy.
 - Automatic prefetch (`Config::prefetch_depth`) no longer waits for a copy
-  to the host. It makes room only by evicting tensors that are free to evict
-  (a clean host copy, or rebuilt), in the policy's order, and it starts
+  in either direction. It makes room only by evicting tensors that are free
+  to evict (a clean host copy, or rebuilt), in the policy's order, and only
+  if that makes enough room; otherwise it evicts nothing. It starts
   write-backs for the tensors the policy would evict next, so they are free
   by the time the following prefetch needs the room. An access that still
   finds no room evicts as before, waiting if it must.
+- A copy made ahead of need (`write_back`, or the write-backs prefetch
+  starts) only takes host memory nobody is using. Under a full host limit it
+  does not start, rather than give up another tensor's clean copy. An
+  eviction that needs host memory can take back the block of a write-back,
+  finished or not.
 - Copies to the device and copies to the host run on separate streams
   (`Config::copy_streams`, 2 by default; 1 restores the single stream).
 
@@ -302,10 +316,16 @@ What this shows:
   out; now it costs the two copies, which no longer wait for the compute
   but take as long as compute plus one copy did.
 - **With almost no compute, prefetching a written workload costs time**
-  (1.63 s against 1.42 s without it, and it was 1.50 s before). Keeping one
-  slot for the incoming layer and one for the outgoing one leaves two
-  layers resident instead of three, so every access misses: 12 reloads per
-  epoch instead of 8.8, and 46 GiB moved instead of 34.
+  (1.63 s against 1.42 s without it, and it was 1.50 s before), because it
+  reloads more. The layer being written back keeps its slot until its copy
+  has finished, next to the slot for the incoming layer, which leaves one
+  layer resident for long instead of three: 10.8 reloads per epoch instead
+  of 8.8, and 41984 MiB moved instead of 34304. At 8 kernels per layer the
+  write-backs fall behind the prefetches, a second outgoing layer is still
+  being copied when room is needed, and every access misses: 12 reloads per
+  epoch and 46464 MiB. At 32 kernels it is 10.8 again. (This paragraph first
+  gave the 8-kernel counters as the 1-kernel ones. The traces behind the
+  correction are in issue #7.)
 - **A second stream does not help on this device.** The differences between
   one and two streams (1.74 s and 1.79 s, 4.01 s and 3.85 s) are inside the
   variance, as one async engine predicts.
@@ -379,21 +399,28 @@ write-back).
   prefetch or when `write_back` is called. An eviction forced by an access
   still waits for the copy, and rebuilding a reconstructible tensor is
   synchronous.
-- This GPU runs one copy at a time (`asyncEngineCount = 1`), so a reload
-  and a write-back take turns even on separate streams. Whether they
-  overlap on a device with more async engines is untested.
-- Prefetching a workload that writes makes every access a miss, and is
-  slower than not prefetching when a layer's compute is shorter than its
-  copies (see the `--dirty` table).
+- This GPU reports `asyncEngineCount = 1`: it runs one copy at a time, so
+  uploads (reloads) and write-backs cannot overlap. They take turns even on
+  separate streams. Whether they overlap on a device with more async
+  engines is untested.
+- Prefetching a workload that writes reloads more (10.8 to 12 layers per
+  epoch here instead of 8.8, see issue #7), and is slower than not
+  prefetching when a layer's compute is shorter than its copies (see the
+  `--dirty` table).
+- With `Policy::EvictLru`, a written workload gets write-backs from
+  automatic prefetch but no prefetches: the tensor written back is the one
+  the next access evicts. Seen in review, not measured in the benchmark.
+- In lazy mode a write-back started by prefetch can page-lock a block, which
+  takes as long as it would have at eviction.
 - Writing to a tensor whose write-back is in flight waits for the copy and
   then throws it away.
 - Page-locked host memory is unlocked only when the host limit needs the
   room for a block of another size, or when the manager is dropped. There
   is no call to give unused blocks back.
-- The eager arena needs a host limit, and with tensors of different sizes
-  it can fragment: a spill may give up clean copies while the arena still
-  has enough free bytes in total, just not in one piece. Not measured yet;
-  the benchmark's layers are all the same size.
+- The eager arena needs a host limit. With tensors of different sizes its
+  free space can end up in pieces; the manager then moves blocks together,
+  which waits for every copy in flight and copies host memory. That cost is
+  not measured: the benchmark's layers are all the same size.
 - Eager allocation moves page-locking into setup but does not make it
   cheaper (about 0.3 ms per MiB either way).
 - A failed prefetch on the copy stream is reported by the next
