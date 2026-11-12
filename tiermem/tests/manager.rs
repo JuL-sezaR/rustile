@@ -688,3 +688,222 @@ fn lazy_unpins_unused_blocks_when_the_host_limit_needs_the_room() {
     m.unregister(last).unwrap();
     assert!(contents(&mut m, big).iter().all(|&v| v == 5.0));
 }
+
+#[test]
+fn the_device_reports_its_async_engine_count() {
+    assert!(tiermem::async_engine_count().unwrap() >= 1);
+}
+
+#[test]
+fn write_back_makes_the_next_eviction_a_free() {
+    let mut m = manager(Policy::EvictLru);
+    let [a, b, c] = [7.0, 1.0, 2.0].map(|v| m.register(tensor(v), Hint::Evictable).unwrap());
+    assert_eq!(m.write_back(&[a]).unwrap(), 1);
+    let s = m.stats();
+    assert_eq!(s.write_backs, 1);
+    assert_eq!(s.bytes_to_host, BYTES as u64);
+    assert_eq!(s.host_bytes, BYTES);
+    assert_eq!(s.evictions, 0);
+    assert!(m.is_resident(a), "writing back does not evict");
+    assert_eq!(m.write_back(&[a]).unwrap(), 0, "already has a host copy");
+
+    m.register(tensor(3.0), Hint::Evictable).unwrap();
+    assert!(!m.is_resident(a));
+    let s = m.stats();
+    assert_eq!(s.bytes_to_host, BYTES as u64, "the eviction copied nothing");
+    assert_eq!(s.clean_evictions, 1);
+    assert!(m.is_resident(b) && m.is_resident(c));
+    assert!(contents(&mut m, a).iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn a_tensor_being_written_back_stays_resident_and_readable() {
+    let mut m = Manager::new(Config::new(3 * BIG, Policy::EvictLru));
+    let a = m
+        .register(api::full(7.0f32, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+        .unwrap();
+    assert_eq!(m.write_back(&[a]).unwrap(), 1);
+    assert!(m.is_resident(a));
+    assert_eq!(
+        m.stats().resident_bytes,
+        BIG,
+        "the device memory is still held"
+    );
+    let copy = m.tensor(a).unwrap().dup().sync().unwrap();
+    assert!(copy.to_host_vec().sync().unwrap().iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn evicting_during_a_write_back_waits_for_the_copy() {
+    let mut m = Manager::new(Config::new(3 * BIG, Policy::EvictLru));
+    let [a, _, _] = [7.0, 1.0, 2.0].map(|v| {
+        m.register(api::full(v, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+            .unwrap()
+    });
+    assert_eq!(m.write_back(&[a]).unwrap(), 1);
+    m.register(api::full(3.0f32, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+        .unwrap();
+    assert!(!m.is_resident(a));
+    let s = m.stats();
+    assert_eq!(s.bytes_to_host, BIG as u64, "one copy, not two");
+    assert_eq!(s.resident_bytes, 3 * BIG);
+    assert!(contents(&mut m, a).iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn writing_during_a_write_back_discards_the_stale_copy() {
+    let mut m = Manager::new(Config::new(3 * BIG, Policy::EvictLru));
+    let [a, _, _] = [7.0, 1.0, 2.0].map(|v| {
+        m.register(api::full(v, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+            .unwrap()
+    });
+    assert_eq!(m.write_back(&[a]).unwrap(), 1);
+    *m.tensor_mut(a).unwrap() = api::full(9.0f32, &[BIG_N]).sync().unwrap();
+    assert_eq!(
+        m.stats().host_bytes,
+        0,
+        "the copy of the old contents is gone"
+    );
+
+    m.register(api::full(3.0f32, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+        .unwrap();
+    assert!(!m.is_resident(a));
+    assert_eq!(m.stats().bytes_to_host, 2 * BIG as u64, "copied again");
+    assert!(contents(&mut m, a).iter().all(|&v| v == 9.0));
+}
+
+#[test]
+fn unregistering_during_a_write_back_returns_the_tensor() {
+    let mut m = Manager::new(Config::new(3 * BIG, Policy::EvictLru));
+    let a = m
+        .register(api::full(7.0f32, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+        .unwrap();
+    assert_eq!(m.write_back(&[a]).unwrap(), 1);
+    let host = m
+        .unregister(a)
+        .unwrap()
+        .expect("on the device")
+        .to_host_vec()
+        .sync()
+        .unwrap();
+    assert!(host.iter().all(|&v| v == 7.0));
+    let s = m.stats();
+    assert_eq!((s.resident_bytes, s.host_bytes), (0, 0));
+}
+
+#[test]
+fn write_back_skips_tensors_with_nothing_to_copy() {
+    let mut m = manager(Policy::EvictLru);
+    let [a, b, _, _] = reloaded_spill(&mut m);
+    let rebuilt = m
+        .register_reconstructible(tensor(5.0), Hint::Evictable, || {
+            Ok(api::full(5.0f32, &[N]).sync()?)
+        })
+        .unwrap();
+    m.ensure_resident(&[a, rebuilt]).unwrap();
+    let before = m.stats().bytes_to_host;
+    assert_eq!(
+        m.write_back(&[a, b, rebuilt]).unwrap(),
+        0,
+        "a is clean, b is on the host, and the third is rebuilt, not copied"
+    );
+    assert_eq!(m.stats().bytes_to_host, before);
+    m.unregister(a).unwrap();
+    assert!(matches!(
+        m.write_back(&[a]),
+        Err(TierError::UnknownTensor(_))
+    ));
+}
+
+#[test]
+fn automatic_prefetch_starts_a_write_back_instead_of_waiting_for_one() {
+    let mut m = Manager::new(Config {
+        prefetch_depth: 1,
+        ..Config::new(3 * BYTES, Policy::EvictLookahead)
+    });
+    let [a, b, c, d] =
+        [0.0, 1.0, 2.0, 3.0].map(|v| m.register(tensor(v), Hint::Evictable).unwrap());
+    assert!(!m.is_resident(a));
+    let spilled = m.stats().bytes_to_host;
+    m.expect_accesses(&[b, a]).unwrap();
+    // Fetching a needs room, and neither c nor d has a host copy. Rather
+    // than copy one back before returning, the manager starts the copy.
+    m.ensure_resident(&[b]).unwrap();
+    let s = m.stats();
+    assert_eq!(s.prefetches, 0, "nothing could be evicted for free");
+    assert_eq!(s.write_backs, 1);
+    assert_eq!(s.evictions, 1, "only a's original eviction");
+    assert!(m.is_resident(c) && m.is_resident(d));
+
+    // The access itself evicts the tensor that was written back.
+    m.ensure_resident(&[a]).unwrap();
+    let s = m.stats();
+    assert_eq!(s.bytes_to_host, spilled + BYTES as u64);
+    assert_eq!(s.clean_evictions, 1);
+}
+
+/// Sweeps six tensors through room for four, overwriting each one every time
+/// it is used, and checks that every tensor ends up with the last value
+/// written to it.
+fn dirty_sweep(copy_streams: usize) -> tiermem::Stats {
+    let mut m = Manager::new(Config {
+        prefetch_depth: 1,
+        copy_streams,
+        ..Config::new(4 * BIG, Policy::EvictLookahead)
+    });
+    let ids: Vec<_> = (0..6)
+        .map(|v| {
+            m.register(
+                api::full(v as f32, &[BIG_N]).sync().unwrap(),
+                Hint::Evictable,
+            )
+            .unwrap()
+        })
+        .collect();
+    const EPOCHS: usize = 4;
+    for _ in 0..EPOCHS {
+        m.expect_accesses(&ids).unwrap();
+    }
+    for epoch in 0..EPOCHS {
+        for (v, &id) in ids.iter().enumerate() {
+            m.ensure_resident(&[id]).unwrap();
+            let seen = m.tensor(id).unwrap().dup().sync().unwrap();
+            let seen = seen.to_host_vec().sync().unwrap();
+            let expected = (100 * epoch + v) as f32;
+            assert!(
+                seen.iter().all(|&x| x == expected),
+                "epoch {epoch} tensor {v}"
+            );
+            *m.tensor_mut(id).unwrap() = api::full(expected + 100.0, &[BIG_N]).sync().unwrap();
+        }
+    }
+    let s = m.stats();
+    assert!(s.peak_resident_bytes <= 4 * BIG);
+    for (v, &id) in ids.iter().enumerate() {
+        let expected = (100 * EPOCHS + v) as f32;
+        assert!(contents(&mut m, id).iter().all(|&x| x == expected));
+    }
+    s
+}
+
+#[test]
+fn written_tensors_survive_write_behind_and_prefetch_on_two_streams() {
+    let s = dirty_sweep(2);
+    assert!(s.write_backs > 0, "copies to the host were started ahead");
+    assert!(s.prefetches > 0, "and reloads too");
+}
+
+#[test]
+fn written_tensors_survive_write_behind_and_prefetch_on_one_stream() {
+    let s = dirty_sweep(1);
+    assert!(s.write_backs > 0 && s.prefetches > 0);
+}
+
+#[test]
+#[should_panic(expected = "copy streams")]
+fn a_manager_has_one_or_two_copy_streams() {
+    let _ = Manager::<f32>::new(Config {
+        copy_streams: 3,
+        ..Config::new(3 * BYTES, Policy::EvictLru)
+    });
+}

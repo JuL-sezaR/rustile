@@ -1,11 +1,11 @@
 //! Host-device migration: the copy operations that run on the manager's
-//! dedicated copy stream, between device tensors and page-locked host blocks
-//! (see [`crate::host`]).
+//! copy streams, between device tensors and page-locked host blocks (see
+//! [`crate::host`]).
 //!
 //! Page-locked ("pinned") memory lets the driver DMA straight to and from the
-//! buffer, and a host-to-device copy from it really is asynchronous. A copy
-//! from pageable memory is staged by the driver before the call returns, so it
-//! can never overlap with compute.
+//! buffer, and a copy to or from it really is asynchronous. A copy involving
+//! pageable memory is staged by the driver before the call returns, so it can
+//! never overlap with compute.
 
 use crate::host::HostBlock;
 use cutile::cuda_async::device_context::with_default_device_policy;
@@ -17,13 +17,14 @@ use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-/// Copies a tensor's contents into `host`, consuming the tensor.
-pub(crate) struct SpillToHost<T: DType> {
-    pub tensor: Tensor<T>,
+/// Copies a tensor's contents into `host`. The tensor is only read, and is
+/// kept alive until the copy has completed.
+pub(crate) struct SaveToHost<T: DType> {
+    pub tensor: Arc<Tensor<T>>,
     pub host: HostBlock,
 }
 
-impl<T: DType> DeviceOp for SpillToHost<T> {
+impl<T: DType> DeviceOp for SaveToHost<T> {
     type Output = HostBlock;
 
     unsafe fn execute(self, ctx: &ExecutionContext) -> Result<HostBlock, DeviceError> {
@@ -34,7 +35,7 @@ impl<T: DType> DeviceOp for SpillToHost<T> {
             ));
         }
         let src = self.tensor.device_pointer().cu_deviceptr();
-        // The device memory must outlive the copy; the host buffer is the
+        // The device memory must outlive the copy; the host block is the
         // output, which the future holds until the copy has completed.
         ctx.retain(self.tensor)?;
         if len > 0 {
@@ -68,7 +69,7 @@ impl<T: DType> DeviceOp for LoadFromHost<T> {
         let dst = tensor.device_pointer().cu_deviceptr();
         let src = self.host.as_ptr::<T>().cast_const();
         ctx.retain(self.host)?;
-        // SAFETY: both sides hold `len` elements; the host buffer is retained
+        // SAFETY: both sides hold `len` elements; the host block is retained
         // by the submission and the tensor by the future's result.
         unsafe { memcpy_htod_async(dst, src, len, ctx.get_cuda_stream())? };
         Ok(tensor)
@@ -92,30 +93,29 @@ macro_rules! impl_into_future {
         }
     };
 }
-impl_into_future!(SpillToHost, HostBlock);
+impl_into_future!(SaveToHost, HostBlock);
 impl_into_future!(LoadFromHost, Tensor<T>);
 
-/// A reload that has been submitted to the copy stream but not waited for.
+/// A copy that has been submitted to a stream but not waited for.
 ///
-/// Dropping it waits for the copy and frees the device memory.
-pub(crate) struct PendingLoad<T: DType>(DeviceFuture<Tensor<T>, LoadFromHost<T>>);
+/// Dropping it waits for the copy and then drops the result.
+pub(crate) struct Pending<Op: DeviceOp>(DeviceFuture<<Op as DeviceOp>::Output, Op>);
 
-pub(crate) enum Started<T: DType> {
+pub(crate) type PendingLoad<T> = Pending<LoadFromHost<T>>;
+pub(crate) type PendingSave<T> = Pending<SaveToHost<T>>;
+
+pub(crate) enum Started<Op: DeviceOp> {
     /// The copy finished before the submission returned.
-    Done(Tensor<T>),
-    Pending(PendingLoad<T>),
+    Done(<Op as DeviceOp>::Output),
+    Pending(Pending<Op>),
 }
 
-/// Submits a reload of `host` on `stream` and returns without waiting.
-pub(crate) fn start_load<T: DType>(
-    host: &Arc<HostBlock>,
+/// Submits `op` on `stream` and returns without waiting.
+pub(crate) fn start<Op: DeviceOp>(
+    op: Op,
     stream: &Arc<Stream>,
-) -> Result<Started<T>, DeviceError> {
-    let op = LoadFromHost {
-        host: host.clone(),
-        dtype: PhantomData,
-    };
-    let mut pending = PendingLoad(DeviceFuture::scheduled(
+) -> Result<Started<Op>, DeviceError> {
+    let mut pending = Pending(DeviceFuture::scheduled(
         op,
         ExecutionContext::new(stream.clone()),
     ));
@@ -125,15 +125,19 @@ pub(crate) fn start_load<T: DType>(
     }
 }
 
-impl<T: DType> PendingLoad<T> {
+impl<Op: DeviceOp> Pending<Op> {
     /// The first poll submits the work. Later polls check the stream itself,
-    /// so no waker is needed.
-    fn poll(&mut self) -> Poll<Result<Tensor<T>, DeviceError>> {
+    /// so no waker is needed. Must not be called again once it has returned
+    /// `Ready`.
+    pub(crate) fn poll(&mut self) -> Poll<Result<<Op as DeviceOp>::Output, DeviceError>> {
         Pin::new(&mut self.0).poll(&mut Context::from_waker(Waker::noop()))
     }
 
-    /// Blocks until the copy has finished.
-    pub(crate) fn wait(mut self, stream: &Arc<Stream>) -> Result<Tensor<T>, DeviceError> {
+    /// Blocks until the copy has finished. `stream` is the one it runs on.
+    pub(crate) fn wait(
+        mut self,
+        stream: &Arc<Stream>,
+    ) -> Result<<Op as DeviceOp>::Output, DeviceError> {
         loop {
             // SAFETY: the stream is alive and its context is current on this
             // thread, which submitted the copy.

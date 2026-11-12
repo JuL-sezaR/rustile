@@ -12,10 +12,12 @@
 //! smaller one.
 //!
 //! Spilled contents live in page-locked host memory, which is locked either
-//! as it is first needed or up front (see [`HostAlloc`]), and move on a CUDA
-//! stream of the manager's own, so a reload started with [`Manager::prefetch`] (or
-//! automatically, see [`Config::prefetch_depth`]) overlaps with kernels
-//! running on other streams.
+//! as it is first needed or up front (see [`HostAlloc`]). They move on CUDA
+//! streams of the manager's own, one for each direction, so a reload started
+//! with [`Manager::prefetch`] and a copy to the host started with
+//! [`Manager::write_back`] (or both automatically, see
+//! [`Config::prefetch_depth`]) overlap with kernels running on other streams
+//! and with each other.
 
 mod copy;
 mod error;
@@ -25,14 +27,15 @@ mod trace;
 pub use error::{EntrySnapshot, Snapshot, TierError};
 pub use trace::{Event, EventKind, Trace};
 
-use copy::{LoadFromHost, PendingLoad, SpillToHost, Started};
+use copy::{LoadFromHost, PendingLoad, PendingSave, SaveToHost, Started};
 use cutile::cuda_async::device_context::{get_default_device, with_device};
-use cutile::cuda_core::Stream;
+use cutile::cuda_core::{DriverError, Stream, sys};
 use cutile::prelude::*;
 use host::{HostBlock, HostPool};
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 /// How expensive a tensor is to move off the device, in eviction order.
@@ -115,15 +118,23 @@ pub struct Config {
     /// After each [`Manager::ensure_resident`], start reloading up to this
     /// many of the next tensors declared with [`Manager::expect_accesses`].
     /// A prefetch never evicts a tensor that is declared to be used sooner
-    /// than the one being fetched. Zero disables it.
+    /// than the one being fetched, and never waits for a copy to the host:
+    /// it evicts only tensors that already have a host copy or can be
+    /// rebuilt. For the others it starts the copy (see
+    /// [`Manager::write_back`]), so that they can make room for the prefetch
+    /// after it. Zero disables all of this.
     pub prefetch_depth: usize,
+    /// How many streams copies run on: 2 gives each direction its own, so a
+    /// reload and a copy to the host can be in flight together; 1 runs every
+    /// copy one after another on a single stream.
+    pub copy_streams: usize,
     pub policy: Policy,
 }
 
 impl Config {
     /// A config with the soft limit at 80% of the budget, pressure re-arming
     /// at 60%, no host limit, host memory locked as it is needed, and no
-    /// automatic prefetch.
+    /// automatic prefetch, and a copy stream for each direction.
     pub fn new(budget_bytes: usize, policy: Policy) -> Self {
         Self {
             budget_bytes,
@@ -132,6 +143,7 @@ impl Config {
             host_limit_bytes: usize::MAX,
             host_alloc: HostAlloc::Lazy,
             prefetch_depth: 0,
+            copy_streams: 2,
             policy,
         }
     }
@@ -170,6 +182,9 @@ pub struct Stats {
     /// Prefetched tensors evicted again before they were used.
     pub prefetches_cancelled: u64,
     pub reconstructions: u64,
+    /// Copies to the host started ahead of eviction, by
+    /// [`Manager::write_back`] or alongside an automatic prefetch.
+    pub write_backs: u64,
     pub bytes_to_host: u64,
     pub bytes_to_device: u64,
 }
@@ -178,7 +193,7 @@ pub struct Stats {
 pub struct TensorId(u64);
 
 enum Location<T: DType> {
-    Device(Tensor<T>),
+    Device(Arc<Tensor<T>>),
     /// A prefetch is copying the contents back; the device memory is already
     /// allocated and counted, and `clean_copy` holds the source.
     Loading(PendingLoad<T>),
@@ -197,6 +212,10 @@ struct Entry<T: DType> {
     /// reloaded from, still valid because nothing has written to it since.
     /// Evicting it again reuses this instead of copying back to the host.
     clean_copy: Option<Arc<HostBlock>>,
+    /// For a resident tensor without a clean copy: a copy to the host that
+    /// is in flight. Once it has finished, its block becomes the clean copy.
+    /// Until then the tensor can be read but not written or freed.
+    save: Option<PendingSave<T>>,
     last_use: u64,
 }
 
@@ -236,6 +255,31 @@ fn dev(e: impl Into<Error>) -> TierError {
     TierError::Device(e.into())
 }
 
+/// How many copies the default device can run at once, as the driver reports
+/// it (`CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT`). With 1, a copy to the host
+/// and a copy to the device take turns even on separate streams.
+pub fn async_engine_count() -> Result<i32, TierError> {
+    with_device(get_default_device(), |device| {
+        let mut count = 0;
+        // SAFETY: `count` is a valid out-pointer and the device handle
+        // belongs to a live `Device`.
+        let code = unsafe {
+            sys::cuDeviceGetAttribute(
+                &mut count,
+                sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_ASYNC_ENGINE_COUNT,
+                device.cu_device(),
+            )
+        };
+        if code == sys::cudaError_enum_CUDA_SUCCESS {
+            Ok(count)
+        } else {
+            Err(DriverError(code))
+        }
+    })
+    .map_err(dev)?
+    .map_err(dev)
+}
+
 pub struct Manager<T: DType> {
     config: Config,
     entries: HashMap<TensorId, Entry<T>>,
@@ -245,8 +289,10 @@ pub struct Manager<T: DType> {
     expected: VecDeque<TensorId>,
     /// The arguments of the last `ensure_resident`; prefetching spares them.
     in_use: Vec<TensorId>,
-    /// Created on first use, so a manager that never migrates needs no stream.
-    copy_stream: Option<Arc<Stream>>,
+    /// The streams for copies to the device and to the host. Created on
+    /// first use, so a manager that never migrates needs no stream.
+    to_device_stream: Option<Arc<Stream>>,
+    to_host_stream: Option<Arc<Stream>>,
     host_pool: HostPool,
     /// The eager arena has been page-locked.
     host_reserved: bool,
@@ -270,6 +316,10 @@ impl<T: DType> Manager<T> {
             config.host_alloc == HostAlloc::Lazy || config.host_limit_bytes != usize::MAX,
             "eager host allocation needs a host limit to size the arena"
         );
+        assert!(
+            (1..=2).contains(&config.copy_streams),
+            "a manager has one or two copy streams"
+        );
         Self {
             config,
             entries: HashMap::new(),
@@ -277,7 +327,8 @@ impl<T: DType> Manager<T> {
             clock: 0,
             expected: VecDeque::new(),
             in_use: Vec::new(),
-            copy_stream: None,
+            to_device_stream: None,
+            to_host_stream: None,
             host_pool: HostPool::new(config.host_limit_bytes),
             host_reserved: false,
             stats: Stats::default(),
@@ -338,8 +389,9 @@ impl<T: DType> Manager<T> {
                 backing,
                 bytes,
                 shape,
-                location: Location::Device(tensor),
+                location: Location::Device(Arc::new(tensor)),
                 clean_copy: None,
+                save: None,
                 last_use: self.clock,
             },
         );
@@ -349,11 +401,13 @@ impl<T: DType> Manager<T> {
     }
 
     /// Removes a tensor from management, returning it if it is on the device.
+    /// Waits for a copy of it that is in flight.
     pub fn unregister(&mut self, id: TensorId) -> Result<Option<Tensor<T>>, TierError> {
         let entry = self.entries.get(&id).ok_or(TierError::UnknownTensor(id))?;
         if matches!(entry.location, Location::Loading(_)) {
             self.finish_load(id)?;
         }
+        self.finish_save(id)?;
         let entry = self.entries.remove(&id).unwrap();
         self.expected.retain(|&e| e != id);
         if entry.clean_copy.is_some() {
@@ -362,7 +416,7 @@ impl<T: DType> Manager<T> {
         match entry.location {
             Location::Device(t) => {
                 self.sub_resident(entry.bytes);
-                Ok(Some(t))
+                Ok(Some(Arc::into_inner(t).expect("no copy holds the tensor")))
             }
             Location::Host(_) => {
                 self.stats.spilled_bytes -= entry.bytes;
@@ -418,10 +472,37 @@ impl<T: DType> Manager<T> {
         protect.extend_from_slice(ids);
         let mut started = 0;
         for &id in ids {
-            match self.start_prefetch(id, &protect, None)? {
+            match self.start_prefetch(id, &protect, None, true)? {
                 Fetch::Started => started += 1,
                 Fetch::Skipped => {}
                 Fetch::NoRoom => break,
+            }
+        }
+        Ok(started)
+    }
+
+    /// Starts copying modified resident tensors to the host without waiting,
+    /// so that evicting them later only frees the device memory. The tensors
+    /// stay resident and can be read while the copy runs.
+    ///
+    /// A tensor whose copy is in flight cannot be reused until the copy has
+    /// finished: evicting it, unregistering it or asking for
+    /// [`Manager::tensor_mut`] waits for what is left. Writing to it then
+    /// discards the copy.
+    ///
+    /// Tensors that are not resident, already have a host copy, or are
+    /// rebuilt rather than copied are skipped. Returns how many copies were
+    /// started.
+    pub fn write_back(&mut self, ids: &[TensorId]) -> Result<usize, TierError> {
+        let mut started = 0;
+        for &id in ids {
+            if !self.entries.contains_key(&id) {
+                return Err(TierError::UnknownTensor(id));
+            }
+            if self.needs_save(id) {
+                self.start_save(id)?;
+                self.stats.write_backs += 1;
+                started += 1;
             }
         }
         Ok(started)
@@ -455,7 +536,7 @@ impl<T: DType> Manager<T> {
             .ok_or(TierError::UnknownTensor(id))?
             .location
         {
-            Location::Device(t) => Ok(t),
+            Location::Device(t) => Ok(t.as_ref()),
             _ => Err(TierError::NotResident(id)),
         }
     }
@@ -463,23 +544,26 @@ impl<T: DType> Manager<T> {
     /// Mutable access to the device tensor for `id`, which must be resident.
     ///
     /// Marks the tensor dirty: its clean host copy, if any, is freed and the
-    /// next eviction copies the contents back to the host. Replacing the
-    /// tensor with one of a different shape is a bug.
+    /// next eviction copies the contents back to the host. If a copy to the
+    /// host is in flight this waits for it first. Replacing the tensor with
+    /// one of a different shape is a bug.
     ///
     /// Writes to a reconstructible tensor do not survive eviction: it is
     /// rebuilt from its original recipe.
     pub fn tensor_mut(&mut self, id: TensorId) -> Result<&mut Tensor<T>, TierError> {
-        let entry = self
-            .entries
-            .get_mut(&id)
-            .ok_or(TierError::UnknownTensor(id))?;
-        let Location::Device(t) = &mut entry.location else {
+        let entry = self.entries.get(&id).ok_or(TierError::UnknownTensor(id))?;
+        if !entry.is_resident() {
             return Err(TierError::NotResident(id));
-        };
+        }
+        self.finish_save(id)?;
+        let entry = self.entries.get_mut(&id).unwrap();
         if entry.clean_copy.take().is_some() {
             self.stats.host_bytes -= entry.bytes;
         }
-        Ok(t)
+        let Location::Device(t) = &mut entry.location else {
+            unreachable!("checked above");
+        };
+        Ok(Arc::get_mut(t).expect("no copy holds the tensor"))
     }
 
     pub fn is_resident(&self, id: TensorId) -> bool {
@@ -546,7 +630,7 @@ impl<T: DType> Manager<T> {
             return Ok(Room::Blocked { could_evict: false });
         }
         while self.stats.resident_bytes + bytes > self.config.budget_bytes {
-            let Some((victim, next_use)) = self.pick_victim(protect) else {
+            let Some(&(victim, next_use)) = self.victims(protect).first() else {
                 return Ok(Room::Blocked { could_evict: false });
             };
             if self.config.policy == Policy::Strict {
@@ -560,15 +644,74 @@ impl<T: DType> Manager<T> {
         Ok(Room::Made)
     }
 
-    /// The tensor to evict next and the position of its next declared use
-    /// (`usize::MAX` if it has none).
-    fn pick_victim(&self, protect: &[TensorId]) -> Option<(TensorId, usize)> {
+    /// Like [`Self::try_make_room`], but never waits for a copy to the host:
+    /// only tensors that can be evicted for free are, in the policy's order.
+    fn try_make_room_now(
+        &mut self,
+        bytes: usize,
+        protect: &[TensorId],
+        keep_before: Option<usize>,
+    ) -> Result<Room, TierError> {
+        let budget = self.config.budget_bytes;
+        if bytes > budget {
+            return Ok(Room::Blocked { could_evict: false });
+        }
+        if self.stats.resident_bytes + bytes <= budget {
+            return Ok(Room::Made);
+        }
+        if self.config.policy == Policy::Strict {
+            return Ok(Room::Blocked { could_evict: true });
+        }
+        for (victim, next_use) in self.victims(protect) {
+            if keep_before.is_some_and(|pos| next_use <= pos) {
+                break;
+            }
+            if !self.evicts_for_free(victim)? {
+                continue;
+            }
+            self.evict(victim)?;
+            if self.stats.resident_bytes + bytes <= budget {
+                return Ok(Room::Made);
+            }
+        }
+        Ok(Room::Blocked { could_evict: true })
+    }
+
+    /// Starts copies to the host for the tensors the policy would evict next
+    /// to make `bytes` of room, unless they can already be evicted for free.
+    fn write_behind(
+        &mut self,
+        bytes: usize,
+        protect: &[TensorId],
+        keep_before: Option<usize>,
+    ) -> Result<(), TierError> {
+        let mut covered = 0;
+        for (victim, next_use) in self.victims(protect) {
+            if covered >= bytes || keep_before.is_some_and(|pos| next_use <= pos) {
+                break;
+            }
+            if !self.entries[&victim].is_resident() {
+                continue;
+            }
+            if self.needs_save(victim) {
+                self.start_save(victim)?;
+                self.stats.write_backs += 1;
+            }
+            covered += self.entries[&victim].bytes;
+        }
+        Ok(())
+    }
+
+    /// The tensors that may be evicted, first victim first, each with the
+    /// position of its next declared use (`usize::MAX` if it has none).
+    fn victims(&self, protect: &[TensorId]) -> Vec<(TensorId, usize)> {
         let mut next_use = HashMap::new();
         for (pos, &id) in self.expected.iter().enumerate() {
             next_use.entry(id).or_insert(pos);
         }
         let lookahead = self.config.policy == Policy::EvictLookahead;
-        self.entries
+        let mut victims: Vec<_> = self
+            .entries
             .iter()
             .filter(|(id, e)| e.on_device() && !protect.contains(id))
             .filter_map(|(&id, e)| {
@@ -579,25 +722,75 @@ impl<T: DType> Manager<T> {
                     (id, next),
                 ))
             })
-            .min_by_key(|&(key, _)| key)
-            .map(|(_, victim)| victim)
+            .collect();
+        victims.sort_by_key(|&(key, _)| key);
+        victims.into_iter().map(|(_, victim)| victim).collect()
     }
 
-    fn copy_stream(&mut self) -> Result<Arc<Stream>, TierError> {
-        if let Some(stream) = &self.copy_stream {
+    /// Whether a resident tensor has contents that exist nowhere else and no
+    /// copy to the host under way.
+    fn needs_save(&self, id: TensorId) -> bool {
+        let e = &self.entries[&id];
+        e.is_resident()
+            && matches!(e.backing, Backing::Spill)
+            && e.clean_copy.is_none()
+            && e.save.is_none()
+    }
+
+    /// Whether evicting this tensor now would copy nothing and wait for
+    /// nothing. Notices a copy to the host that has finished.
+    fn evicts_for_free(&mut self, id: TensorId) -> Result<bool, TierError> {
+        let bytes = self.entries[&id].bytes;
+        let entry = self.entries.get_mut(&id).unwrap();
+        if let Some(save) = &mut entry.save {
+            match save.poll() {
+                Poll::Pending => return Ok(false),
+                Poll::Ready(result) => {
+                    entry.save = None;
+                    match result {
+                        Ok(host) => entry.clean_copy = Some(Arc::new(host)),
+                        Err(e) => {
+                            self.stats.host_bytes -= bytes;
+                            return Err(dev(e));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(!self.needs_save(id))
+    }
+
+    fn new_stream() -> Result<Arc<Stream>, TierError> {
+        with_device(get_default_device(), |device| device.new_stream())
+            .map_err(dev)?
+            .map_err(dev)
+    }
+
+    fn to_device_stream(&mut self) -> Result<Arc<Stream>, TierError> {
+        if let Some(stream) = &self.to_device_stream {
             return Ok(stream.clone());
         }
-        let stream = with_device(get_default_device(), |device| device.new_stream())
-            .map_err(dev)?
-            .map_err(dev)?;
-        self.copy_stream = Some(stream.clone());
+        let stream = Self::new_stream()?;
+        self.to_device_stream = Some(stream.clone());
+        Ok(stream)
+    }
+
+    fn to_host_stream(&mut self) -> Result<Arc<Stream>, TierError> {
+        if self.config.copy_streams == 1 {
+            return self.to_device_stream();
+        }
+        if let Some(stream) = &self.to_host_stream {
+            return Ok(stream.clone());
+        }
+        let stream = Self::new_stream()?;
+        self.to_host_stream = Some(stream.clone());
         Ok(stream)
     }
 
     /// Page-locks the eager arena, once.
     fn reserve_host(&mut self) -> Result<(), TierError> {
         if self.config.host_alloc == HostAlloc::Eager && !self.host_reserved {
-            let stream = self.copy_stream()?;
+            let stream = self.to_host_stream()?;
             self.host_pool
                 .reserve(stream.device(), self.config.host_limit_bytes)
                 .map_err(dev)?;
@@ -636,21 +829,62 @@ impl<T: DType> Manager<T> {
         }
     }
 
+    /// Submits a copy of a resident tensor to the host and returns without
+    /// waiting. The tensor must need one (see [`Self::needs_save`]).
+    fn start_save(&mut self, id: TensorId) -> Result<(), TierError> {
+        let start = self.trace.now();
+        let stream = self.to_host_stream()?;
+        let bytes = self.entries[&id].bytes;
+        let host = self.alloc_host(bytes, &stream)?;
+        let entry = self.entries.get_mut(&id).unwrap();
+        let Location::Device(tensor) = &entry.location else {
+            unreachable!("only a resident tensor is copied to the host");
+        };
+        let tensor = tensor.clone();
+        match copy::start(SaveToHost { tensor, host }, &stream).map_err(dev)? {
+            Started::Done(host) => entry.clean_copy = Some(Arc::new(host)),
+            Started::Pending(pending) => entry.save = Some(pending),
+        }
+        self.stats.host_bytes += bytes;
+        self.stats.bytes_to_host += bytes as u64;
+        self.trace
+            .span(EventKind::WriteBack, Some(id), bytes, start);
+        Ok(())
+    }
+
+    /// Waits for a copy to the host that is in flight, if there is one, and
+    /// makes its block the tensor's clean copy.
+    fn finish_save(&mut self, id: TensorId) -> Result<(), TierError> {
+        if self.entries[&id].save.is_none() {
+            return Ok(());
+        }
+        let stream = self.to_host_stream()?;
+        let entry = self.entries.get_mut(&id).unwrap();
+        let pending = entry.save.take().unwrap();
+        match pending.wait(&stream) {
+            Ok(host) => {
+                entry.clean_copy = Some(Arc::new(host));
+                Ok(())
+            }
+            // The tensor is still on the device, without a host copy.
+            Err(e) => {
+                self.stats.host_bytes -= entry.bytes;
+                Err(dev(e))
+            }
+        }
+    }
+
     fn evict(&mut self, id: TensorId) -> Result<(), TierError> {
         let start = self.trace.now();
-        let entry = &self.entries[&id];
-        let bytes = entry.bytes;
-        // Everything that can fail without losing the contents happens before
-        // the tensor is taken off the device.
-        let fresh_host = match (&entry.location, &entry.backing, &entry.clean_copy) {
-            (Location::Device(_), Backing::Spill, None) => {
-                let stream = self.copy_stream()?;
-                let host = self.alloc_host(bytes, &stream)?;
-                Some((stream, host))
-            }
-            _ => None,
-        };
+        // Everything that can fail happens before the tensor is taken off
+        // the device, so a failed eviction loses nothing.
+        let copied = self.needs_save(id);
+        if copied {
+            self.start_save(id)?;
+        }
+        self.finish_save(id)?;
         let entry = self.entries.get_mut(&id).unwrap();
+        let bytes = entry.bytes;
         let outcome = match std::mem::replace(&mut entry.location, Location::Dropped) {
             Location::Loading(pending) => {
                 // Waits for the copy, then frees the device memory.
@@ -659,33 +893,19 @@ impl<T: DType> Manager<T> {
                 entry.location = Location::Host(host.expect("a loading tensor keeps its source"));
                 Evicted::Cancelled
             }
-            Location::Device(tensor) => {
-                match (&entry.backing, entry.clean_copy.take(), fresh_host) {
-                    (Backing::Reconstruct(_), _, _) => Evicted::Dropped,
-                    (Backing::Spill, Some(host), _) => {
-                        entry.location = Location::Host(host);
+            // Dropping the tensor frees the device memory.
+            Location::Device(_) => match (&entry.backing, entry.clean_copy.take()) {
+                (Backing::Reconstruct(_), _) => Evicted::Dropped,
+                (Backing::Spill, Some(host)) => {
+                    entry.location = Location::Host(host);
+                    if copied {
+                        Evicted::Copied
+                    } else {
                         Evicted::Clean
                     }
-                    (Backing::Spill, None, Some((stream, host))) => {
-                        match (SpillToHost { tensor, host }).sync_on(&stream) {
-                            Ok(host) => {
-                                entry.location = Location::Host(Arc::new(host));
-                                Evicted::Copied
-                            }
-                            // The copy consumed the tensor, so its contents are lost.
-                            Err(e) => {
-                                self.entries.remove(&id);
-                                self.expected.retain(|&e| e != id);
-                                self.sub_resident(bytes);
-                                return Err(dev(e));
-                            }
-                        }
-                    }
-                    (Backing::Spill, None, None) => {
-                        unreachable!("a host buffer was prepared above")
-                    }
                 }
-            }
+                (Backing::Spill, None) => unreachable!("a host copy was made above"),
+            },
             Location::Host(_) | Location::Dropped => {
                 unreachable!("only tensors on the device are eviction victims")
             }
@@ -693,11 +913,7 @@ impl<T: DType> Manager<T> {
         self.sub_resident(bytes);
         self.stats.evictions += 1;
         match outcome {
-            Evicted::Copied => {
-                self.stats.spilled_bytes += bytes;
-                self.stats.host_bytes += bytes;
-                self.stats.bytes_to_host += bytes as u64;
-            }
+            Evicted::Copied => self.stats.spilled_bytes += bytes,
             Evicted::Clean | Evicted::Cancelled => {
                 self.stats.spilled_bytes += bytes;
                 self.stats.clean_evictions += 1;
@@ -720,7 +936,7 @@ impl<T: DType> Manager<T> {
         let start = self.trace.now();
         let was_spilled = matches!(self.entries[&id].location, Location::Host(_));
         let stream = if was_spilled {
-            Some(self.copy_stream()?)
+            Some(self.to_device_stream()?)
         } else {
             None
         };
@@ -740,7 +956,7 @@ impl<T: DType> Manager<T> {
                 unreachable!("spilled tensors are kept on the host")
             }
         };
-        let old = std::mem::replace(&mut entry.location, Location::Device(tensor));
+        let old = std::mem::replace(&mut entry.location, Location::Device(Arc::new(tensor)));
         if let Location::Host(host) = old {
             // Kept as a clean copy, so host_bytes is unchanged.
             entry.clean_copy = Some(host);
@@ -759,7 +975,9 @@ impl<T: DType> Manager<T> {
         Ok(())
     }
 
-    /// Starts reloading the next `prefetch_depth` distinct declared tensors.
+    /// Starts reloading the next `prefetch_depth` distinct declared tensors,
+    /// without waiting for anything, and starts the copies to the host that
+    /// will let the prefetches after these make room for free.
     fn prefetch_expected(&mut self, in_use: &[TensorId]) -> Result<(), TierError> {
         let mut targets: Vec<(usize, TensorId)> = Vec::new();
         for (pos, &id) in self.expected.iter().enumerate() {
@@ -772,8 +990,17 @@ impl<T: DType> Manager<T> {
         }
         let mut protect = in_use.to_vec();
         protect.extend(targets.iter().map(|&(_, id)| id));
+        // How much room this round of prefetches asked for, and the plan
+        // position of the last one that asked.
+        let mut wanted = 0;
+        let mut last = None;
         for (pos, id) in targets {
-            match self.start_prefetch(id, &protect, Some(pos)) {
+            let fetch = self.start_prefetch(id, &protect, Some(pos), false);
+            if !matches!(fetch, Ok(Fetch::Skipped)) {
+                wanted += self.entries[&id].bytes;
+                last = Some(pos);
+            }
+            match fetch {
                 Ok(Fetch::Started | Fetch::Skipped) => {}
                 Ok(Fetch::NoRoom) => break,
                 // Prefetching is best effort; the access itself will report
@@ -782,24 +1009,38 @@ impl<T: DType> Manager<T> {
                 Err(e) => return Err(e),
             }
         }
+        if wanted > 0 {
+            match self.write_behind(wanted, &protect, last) {
+                Err(e) if !e.is_recoverable() => return Err(e),
+                _ => {}
+            }
+        }
         Ok(())
     }
 
+    /// With `wait`, room is made as for an access, which may copy a victim
+    /// to the host first; without it only free evictions are used.
     fn start_prefetch(
         &mut self,
         id: TensorId,
         protect: &[TensorId],
         keep_before: Option<usize>,
+        wait: bool,
     ) -> Result<Fetch, TierError> {
         let entry = self.entries.get(&id).ok_or(TierError::UnknownTensor(id))?;
         if !matches!(entry.location, Location::Host(_)) {
             return Ok(Fetch::Skipped);
         }
         let bytes = entry.bytes;
-        if let Room::Blocked { .. } = self.try_make_room(bytes, protect, keep_before)? {
+        let room = if wait {
+            self.try_make_room(bytes, protect, keep_before)?
+        } else {
+            self.try_make_room_now(bytes, protect, keep_before)?
+        };
+        if let Room::Blocked { .. } = room {
             return Ok(Fetch::NoRoom);
         }
-        let stream = self.copy_stream()?;
+        let stream = self.to_device_stream()?;
         let start = self.trace.now();
         self.clock += 1;
         let entry = self.entries.get_mut(&id).unwrap();
@@ -808,8 +1049,15 @@ impl<T: DType> Manager<T> {
             unreachable!("making room does not reload anything");
         };
         let host = host.clone();
-        let (location, done) = match copy::start_load(&host, &stream).map_err(dev)? {
-            Started::Done(tensor) => (Location::Device(tensor.reshape(&entry.shape)?), true),
+        let load = LoadFromHost {
+            host: host.clone(),
+            dtype: PhantomData,
+        };
+        let (location, done) = match copy::start(load, &stream).map_err(dev)? {
+            Started::Done(tensor) => (
+                Location::Device(Arc::new(tensor.reshape(&entry.shape)?)),
+                true,
+            ),
             Started::Pending(pending) => (Location::Loading(pending), false),
         };
         entry.location = location;
@@ -830,7 +1078,7 @@ impl<T: DType> Manager<T> {
     /// Waits for a prefetched tensor's copy and makes it resident.
     fn finish_load(&mut self, id: TensorId) -> Result<(), TierError> {
         let start = self.trace.now();
-        let stream = self.copy_stream()?;
+        let stream = self.to_device_stream()?;
         let entry = self.entries.get_mut(&id).unwrap();
         let bytes = entry.bytes;
         let Location::Loading(pending) = std::mem::replace(&mut entry.location, Location::Dropped)
@@ -843,7 +1091,7 @@ impl<T: DType> Manager<T> {
             .and_then(|tensor| Ok(tensor.reshape(&entry.shape)?));
         match loaded {
             Ok(tensor) => {
-                entry.location = Location::Device(tensor);
+                entry.location = Location::Device(Arc::new(tensor));
                 self.stats.reloads += 1;
                 self.trace.span(EventKind::Reload, Some(id), bytes, start);
                 Ok(())

@@ -23,6 +23,9 @@ pub enum EventKind {
     Reload,
     /// A reload submitted to the copy stream without waiting.
     Prefetch,
+    /// A copy to the host submitted without waiting; the tensor stays
+    /// resident.
+    WriteBack,
     Reconstruct,
     Pressure,
     /// Resident bytes after a change; `bytes` holds the new total.
@@ -45,6 +48,7 @@ impl EventKind {
             EventKind::Evict { spilled: false, .. } => "evict_drop",
             EventKind::Reload => "reload",
             EventKind::Prefetch => "prefetch",
+            EventKind::WriteBack => "write_back",
             EventKind::Reconstruct => "reconstruct",
             EventKind::Pressure => "pressure",
             EventKind::Resident => "resident_bytes",
