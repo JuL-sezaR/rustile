@@ -11,6 +11,9 @@ enforcement across processes (quotas, isolation, accounting) move toward the
 kernel, through cgroups, eBPF or HMM, and only once the API has been proven
 here.
 
+Ideas and plans that are not implemented or not measured, including the
+feasibility report for the next milestone, are in [NOVELTIES.md](NOVELTIES.md).
+
 ## Crates
 
 | Crate | What it is |
