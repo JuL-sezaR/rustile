@@ -196,7 +196,7 @@ enum Location<T: DType> {
     Device(Arc<Tensor<T>>),
     /// A prefetch is copying the contents back; the device memory is already
     /// allocated and counted, and `clean_copy` holds the source.
-    Loading(PendingLoad<T>),
+    Loading(Box<PendingLoad<T>>),
     Host(Arc<HostBlock>),
     /// Evicted with [`Backing::Reconstruct`]; nothing is kept.
     Dropped,
@@ -291,8 +291,8 @@ pub struct Manager<T: DType> {
     in_use: Vec<TensorId>,
     /// The streams for copies to the device and to the host. Created on
     /// first use, so a manager that never migrates needs no stream.
-    to_device_stream: Option<Arc<Stream>>,
-    to_host_stream: Option<Arc<Stream>>,
+    stream_to_device: Option<Arc<Stream>>,
+    stream_to_host: Option<Arc<Stream>>,
     host_pool: HostPool,
     /// The eager arena has been page-locked.
     host_reserved: bool,
@@ -327,8 +327,8 @@ impl<T: DType> Manager<T> {
             clock: 0,
             expected: VecDeque::new(),
             in_use: Vec::new(),
-            to_device_stream: None,
-            to_host_stream: None,
+            stream_to_device: None,
+            stream_to_host: None,
             host_pool: HostPool::new(config.host_limit_bytes),
             host_reserved: false,
             stats: Stats::default(),
@@ -766,31 +766,31 @@ impl<T: DType> Manager<T> {
             .map_err(dev)
     }
 
-    fn to_device_stream(&mut self) -> Result<Arc<Stream>, TierError> {
-        if let Some(stream) = &self.to_device_stream {
+    fn stream_to_device(&mut self) -> Result<Arc<Stream>, TierError> {
+        if let Some(stream) = &self.stream_to_device {
             return Ok(stream.clone());
         }
         let stream = Self::new_stream()?;
-        self.to_device_stream = Some(stream.clone());
+        self.stream_to_device = Some(stream.clone());
         Ok(stream)
     }
 
-    fn to_host_stream(&mut self) -> Result<Arc<Stream>, TierError> {
+    fn stream_to_host(&mut self) -> Result<Arc<Stream>, TierError> {
         if self.config.copy_streams == 1 {
-            return self.to_device_stream();
+            return self.stream_to_device();
         }
-        if let Some(stream) = &self.to_host_stream {
+        if let Some(stream) = &self.stream_to_host {
             return Ok(stream.clone());
         }
         let stream = Self::new_stream()?;
-        self.to_host_stream = Some(stream.clone());
+        self.stream_to_host = Some(stream.clone());
         Ok(stream)
     }
 
     /// Page-locks the eager arena, once.
     fn reserve_host(&mut self) -> Result<(), TierError> {
         if self.config.host_alloc == HostAlloc::Eager && !self.host_reserved {
-            let stream = self.to_host_stream()?;
+            let stream = self.stream_to_host()?;
             self.host_pool
                 .reserve(stream.device(), self.config.host_limit_bytes)
                 .map_err(dev)?;
@@ -833,7 +833,7 @@ impl<T: DType> Manager<T> {
     /// waiting. The tensor must need one (see [`Self::needs_save`]).
     fn start_save(&mut self, id: TensorId) -> Result<(), TierError> {
         let start = self.trace.now();
-        let stream = self.to_host_stream()?;
+        let stream = self.stream_to_host()?;
         let bytes = self.entries[&id].bytes;
         let host = self.alloc_host(bytes, &stream)?;
         let entry = self.entries.get_mut(&id).unwrap();
@@ -858,7 +858,7 @@ impl<T: DType> Manager<T> {
         if self.entries[&id].save.is_none() {
             return Ok(());
         }
-        let stream = self.to_host_stream()?;
+        let stream = self.stream_to_host()?;
         let entry = self.entries.get_mut(&id).unwrap();
         let pending = entry.save.take().unwrap();
         match pending.wait(&stream) {
@@ -936,7 +936,7 @@ impl<T: DType> Manager<T> {
         let start = self.trace.now();
         let was_spilled = matches!(self.entries[&id].location, Location::Host(_));
         let stream = if was_spilled {
-            Some(self.to_device_stream()?)
+            Some(self.stream_to_device()?)
         } else {
             None
         };
@@ -1040,7 +1040,7 @@ impl<T: DType> Manager<T> {
         if let Room::Blocked { .. } = room {
             return Ok(Fetch::NoRoom);
         }
-        let stream = self.to_device_stream()?;
+        let stream = self.stream_to_device()?;
         let start = self.trace.now();
         self.clock += 1;
         let entry = self.entries.get_mut(&id).unwrap();
@@ -1058,7 +1058,7 @@ impl<T: DType> Manager<T> {
                 Location::Device(Arc::new(tensor.reshape(&entry.shape)?)),
                 true,
             ),
-            Started::Pending(pending) => (Location::Loading(pending), false),
+            Started::Pending(pending) => (Location::Loading(Box::new(pending)), false),
         };
         entry.location = location;
         entry.clean_copy = Some(host);
@@ -1078,7 +1078,7 @@ impl<T: DType> Manager<T> {
     /// Waits for a prefetched tensor's copy and makes it resident.
     fn finish_load(&mut self, id: TensorId) -> Result<(), TierError> {
         let start = self.trace.now();
-        let stream = self.to_device_stream()?;
+        let stream = self.stream_to_device()?;
         let entry = self.entries.get_mut(&id).unwrap();
         let bytes = entry.bytes;
         let Location::Loading(pending) = std::mem::replace(&mut entry.location, Location::Dropped)

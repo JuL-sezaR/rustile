@@ -3,8 +3,8 @@
 //!
 //!   cargo run --release -p tiermem --example overbudget -- [MODE] [--lookahead]
 //!       [--prefetch N] [--host-limit-mib N] [--host-alloc lazy|eager]
-//!       [--work N] [--dirty] [--budget-mib N] [--layers N] [--layer-mib N]
-//!       [--epochs N] [--trace PATH]
+//!       [--copy-streams N] [--work N] [--dirty] [--budget-mib N]
+//!       [--layers N] [--layer-mib N] [--epochs N] [--trace PATH]
 //!
 //! MODE is one of:
 //!   strict       no eviction: behaves like a GPU with only --budget-mib of memory
@@ -20,6 +20,8 @@
 //! are registered, instead of a block per layer as each is first spilled
 //! (lazy, the default). Without --host-limit-mib the arena is as large as the
 //! working set.
+//! --copy-streams 1 runs copies in both directions on one stream instead of
+//! one each (2, the default).
 //! --work N runs the kernel N times per layer, standing in for a heavier
 //! layer; this is the compute a prefetch can overlap with.
 //!
@@ -74,6 +76,7 @@ struct Args {
     prefetch: usize,
     host_limit_mib: Option<usize>,
     host_alloc: HostAlloc,
+    copy_streams: usize,
     work: usize,
     dirty: bool,
     budget_mib: usize,
@@ -90,6 +93,7 @@ fn parse_args() -> Args {
         prefetch: 0,
         host_limit_mib: None,
         host_alloc: HostAlloc::Lazy,
+        copy_streams: 2,
         work: 1,
         dirty: false,
         budget_mib: 256,
@@ -119,6 +123,7 @@ fn parse_args() -> Args {
                     other => panic!("--host-alloc needs lazy or eager, got {other:?}"),
                 }
             }
+            "--copy-streams" => args.copy_streams = num("--copy-streams"),
             "--work" => args.work = num("--work"),
             "--dirty" => args.dirty = true,
             "--budget-mib" => args.budget_mib = num("--budget-mib"),
@@ -156,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         prefetch_depth: args.prefetch,
         host_limit_bytes: args.host_limit_mib.map_or(usize::MAX, |mib| mib * MIB),
         host_alloc: args.host_alloc,
+        copy_streams: args.copy_streams,
         ..Config::new(args.budget_mib * MIB, policy)
     });
     let pressure_events = Rc::new(Cell::new(0u32));
@@ -185,6 +191,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.layers,
         args.layer_mib,
         args.epochs,
+    );
+
+    println!(
+        "async engines   {} (copies the device can run at once); {} copy stream(s)",
+        tiermem::async_engine_count()?,
+        args.copy_streams
     );
 
     // Warm the JIT so compile time does not land in the measurement.
@@ -306,6 +318,10 @@ fn finish(
     println!(
         "prefetches      {} ({} cancelled)",
         s.prefetches, s.prefetches_cancelled
+    );
+    println!(
+        "write-backs     {} (started ahead of eviction)",
+        s.write_backs
     );
     println!("reconstructions {}", s.reconstructions);
     println!(
