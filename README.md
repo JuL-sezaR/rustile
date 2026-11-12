@@ -35,6 +35,7 @@ cargo run --release -p tiermem --example overbudget -- spill --budget-mib 1024  
 # add --work N to run the kernel N times per layer (a heavier layer)
 # add --dirty to mark each layer as written after use, so evictions copy back
 # add --copy-streams 1 to run copies in both directions on one stream
+# add --runs N for N measured runs after a warmup run (default 5)
 # add --trace out.json and open it in ui.perfetto.dev
 ```
 
@@ -325,6 +326,46 @@ of 2 only reloads more (320 layers against 289 over the run). Measured on the
 run phase alone, prefetching hides about 70% of the overhead at 8 and 32
 kernels per layer; the "about half" and "about 60%" above were computed on
 totals that included setup.
+
+## Measuring
+
+The benchmark now repeats itself. `--runs N` (default 5) does one warmup run
+that is not reported, then N runs, each with a fresh manager, and prints the
+median, minimum and maximum of the total, setup, run and page-locking times.
+The counters and the trace are those of the last run. A workload that cannot
+be admitted at all (`strict`) is reported once and not repeated.
+
+```
+time            0.367 s  (min 0.364, max 0.393)
+  setup         0.181 s  (min 0.181, max 0.183)
+  run           0.146 s  (min 0.145, max 0.172)
+page-locking    0.192 s  (min 0.190, max 0.218)  for 704 MiB (as first spilled)
+```
+
+The tables above were measured by running the whole process six times and
+dropping the first. The in-process medians agree with them (RTX 5080 Laptop,
+WSL2, 2026-11-12; `spill --lookahead`, median of 5 after the warmup):
+
+| | Processes | `--runs 5` |
+|---|---|---|
+| 3 epochs, total | 0.372 s | 0.367 s |
+| 3 epochs, run | 0.148 s | 0.146 s |
+| 3 epochs, run, `--host-alloc eager` | 0.086 s | 0.089 s |
+| 30 epochs, run | 0.853 s | 0.871 s |
+| 30 epochs, run, `--host-alloc eager` | 0.769 s | 0.788 s |
+
+Each run page-locks its host memory again, so the one-time costs are still
+in every run, reported on their own lines.
+
+**The copies themselves are close to the link's limit.** Taken from the trace
+of a 30-epoch run (`--lookahead --host-alloc eager --trace`), a 64 MiB
+reload takes 2.46 ms (264 reloads, 10th to 90th percentile 2.44 to 2.50 ms),
+which is 27 GB/s, and a 64 MiB copy back to the host takes 2.51 ms (272 of
+them with `--dirty`). `nvidia-smi` reports the GPU's link as PCIe 5.0 x8,
+which carries 31.5 GB/s before protocol overhead. So there is at most about
+15% left to gain from faster copies. What remains has to come from avoiding
+copies (fewer misses, clean copies) or hiding them behind compute (prefetch,
+write-back).
 
 ## Limitations
 
