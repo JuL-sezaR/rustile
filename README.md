@@ -11,8 +11,9 @@ enforcement across processes (quotas, isolation, accounting) move toward the
 kernel, through cgroups, eBPF or HMM, and only once the API has been proven
 here.
 
-Ideas and plans that are not implemented or not measured, including the
-feasibility report for the next milestone, are in [NOVELTIES.md](NOVELTIES.md).
+Ideas that are not implemented or not measured are in
+[NOVELTIES.md](NOVELTIES.md). The feasibility report for the next milestone
+is in [docs/milestone-2-feasibility.md](docs/milestone-2-feasibility.md).
 
 ## Crates
 
