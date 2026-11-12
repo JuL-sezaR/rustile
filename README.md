@@ -11,11 +11,15 @@ enforcement across processes (quotas, isolation, accounting) move toward the
 kernel, through cgroups, eBPF or HMM, and only once the API has been proven
 here.
 
+Ideas that are not implemented or not measured are in
+[NOVELTIES.md](NOVELTIES.md). The feasibility report for the next milestone
+is in [docs/milestone-2-feasibility.md](docs/milestone-2-feasibility.md).
+
 ## Crates
 
 | Crate | What it is |
 |---|---|
-| [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction and prefetch on a separate copy stream, a host RAM limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
+| [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
@@ -30,8 +34,12 @@ cargo run --release -p tiermem --example overbudget -- rebuild   # LRU, regenera
 cargo run --release -p tiermem --example overbudget -- spill --lookahead  # declared layer order
 cargo run --release -p tiermem --example overbudget -- spill --lookahead --prefetch 1  # reload ahead of use
 cargo run --release -p tiermem --example overbudget -- spill --lookahead --host-limit-mib 576  # cap host RAM
+cargo run --release -p tiermem --example overbudget -- spill --lookahead --host-alloc eager  # page-lock host RAM up front
 cargo run --release -p tiermem --example overbudget -- spill --budget-mib 1024  # everything fits
 # add --work N to run the kernel N times per layer (a heavier layer)
+# add --dirty to mark each layer as written after use, so evictions copy back
+# add --copy-streams 1 to run copies in both directions on one stream
+# add --runs N for N measured runs after a warmup run (default 5)
 # add --trace out.json and open it in ui.perfetto.dev
 ```
 
@@ -135,9 +143,11 @@ day (RTX 5080 Laptop, WSL2, 2026-11-12; times vary by about ±10% run to run):
 | fits in budget | — | 0.07 s | — | 0.17 s |
 
 A 64 MiB reload now takes about 2.4 ms. What is left in the short run is
-setup: page-locking a 64 MiB buffer takes about 29 ms here, and it happens
-once per layer, the first time it is spilled (about 320 ms of the 3-epoch
-run). It does not recur, which is why the 30-epoch run gains more.
+mostly page-locking the host buffers. It happens once per layer, the first
+time it is spilled, and does not recur, which is why the 30-epoch run gains
+more. (This section first put that cost at 29 ms per 64 MiB buffer, about
+320 ms per run. Timed directly it is about 18 ms per buffer and 0.2 s per
+run; see "Host memory pool" below.)
 
 Prefetch only pays when there is compute to overlap with. One pass of the add
 kernel takes about 0.3 ms per layer, far less than the copy, so `--work N`
@@ -149,8 +159,8 @@ runs it N times per layer (30 epochs, lookahead):
 | 8 kernels (~2.7 ms) | 0.97 s | 1.87 s | 1.38 s | about half |
 | 32 kernels (~10 ms) | 3.67 s | 4.53 s | 3.99 s | about 60% |
 
-All of these runs still include the ~0.3 s of one-time page-locking, which
-accounts for most of the 0.32 s that remains with 32 kernels per layer. Prefetching reloads slightly more (10 layers
+All of these runs still include about 0.2 s of one-time page-locking, which
+is part of the 0.32 s that remains with 32 kernels per layer. Prefetching reloads slightly more (10 layers
 per epoch instead of 9, because one of the four slots holds the incoming
 layer). `--prefetch 2` measured the same as 1: copies on one stream run one
 after another.
@@ -172,23 +182,248 @@ page-locked buffer for the spill. If none are left, the eviction fails with
 the recoverable `TierError::HostBudgetExceeded` and the tensor stays on the
 device.
 
-With `--lookahead --host-limit-mib 576` the benchmark passes in 0.51 s, with
-29 clean copies given up and 2432 MiB copied to the host instead of 704: a
-tensor without a clean copy has to be copied back when it is evicted. 576 MiB
+With `--lookahead --host-limit-mib 576` the benchmark passes in 0.33 s, with
+4 clean copies given up and 832 MiB copied to the host instead of 704: a
+tensor without a clean copy has to be copied back when it is evicted. (An
+earlier version of this section reported 29 clean copies and 2432 MiB. That
+was measured before a freed buffer was reused for the next spill, and the
+text was not updated when that changed.) 576 MiB
 is the minimum here, the 512 MiB that cannot be on the device plus one layer,
 because a victim is spilled before the incoming layer's host copy can be
-released.
+released. With `--prefetch 1` added, the same limit passes in 0.31 s, with
+576 MiB copied to the host and no clean copy given up.
+
+## Host memory pool
+
+Page-locked host memory now comes from a pool (`tiermem/src/host.rs`) instead
+of one driver allocation per tensor. A block that is given back, because its
+tensor was written to, unregistered, or lost its clean copy to the host
+limit, serves a later spill without being locked again. The pool hands out
+bytes, packed without padding, so tensors of any element type and size can
+share it and the host limit counts exactly the bytes held.
+
+`Config::host_alloc` chooses when the memory is locked:
+
+- `HostAlloc::Lazy` (the default) locks a block the first time a spill finds
+  no free one of its size, as before. Each block is locked on its own, so
+  blocks of different sizes never leave unusable gaps; an unused block of
+  another size is unlocked when the host limit needs its room.
+- `HostAlloc::Eager` locks one arena of `Config::host_limit_bytes` when the
+  first spillable tensor is registered, and never grows it. If its free space
+  ends up in pieces too small for a spill, the blocks are moved together.
+
+In both modes a spill fails with `HostBudgetExceeded` only when the bytes
+held plus the bytes asked for exceed the limit.
+
+`Stats::pinned_bytes` and `Stats::pin_time` report what was locked and how
+long it took. The benchmark now splits its time into setup (creating and
+registering the layers), run (the epochs) and the final check, because
+registering 12 layers under a 4-layer budget already spills 8 of them.
+
+Same benchmark, previous commit against this one (RTX 5080 Laptop, WSL2,
+2026-11-12; median of 5 processes after one warmup process, nothing else
+excluded; the previous commit only reports a total):
+
+| Mode | Total, before | Total, lazy | Total, eager | Run only, lazy | Run only, eager |
+|---|---|---|---|---|---|
+| spill, LRU, 3 epochs | 0.42 s | 0.42 s | 0.42 s | 0.20 s | 0.11 s |
+| spill, lookahead, 3 epochs | 0.37 s | 0.37 s | 0.40 s | 0.15 s | 0.086 s |
+| spill, LRU, 30 epochs | 1.41 s | 1.31 s | 1.38 s | 1.08 s | 1.00 s |
+| spill, lookahead, 30 epochs | 1.08 s | 1.08 s | 1.09 s | 0.85 s | 0.77 s |
+
+| One-time cost | Lazy | Eager |
+|---|---|---|
+| Memory page-locked | 704 MiB, in 11 blocks | 768 MiB, one arena |
+| Time page-locking | 0.19 to 0.21 s | 0.21 to 0.27 s |
+| Setup phase | 0.19 s | 0.27 to 0.34 s |
+
+What this shows:
+
+- **The total does not change.** Page-locking costs about 0.3 ms per MiB
+  whether it is done in one call or eleven, so one arena is not cheaper than
+  separate buffers. Eager allocation moves the cost; it does not remove it.
+- **The run phase loses it.** With eager allocation nothing is locked after
+  setup, and the 3-epoch run drops from 0.15 s to 0.086 s (lookahead) and
+  from 0.20 s to 0.11 s (LRU). At 30 epochs the same 0.07 to 0.08 s is less
+  than 10% of the run, which is inside the run-to-run variance, so no
+  difference is claimed there.
+- **Lazy allocation already paid most of it during setup** in this
+  benchmark: only the 3 or 4 layers that are first spilled during the first
+  epoch are locked inside the run.
+- **The cost is smaller than this README said.** The 29 ms per 64 MiB buffer
+  quoted earlier does not hold up when the allocation call is timed
+  directly: the median is about 18 ms per buffer (0.2 s for 704 MiB), though
+  single runs reached 0.35 s.
+
+Under a host limit the arena behaves like lazy allocation:
+`--lookahead --host-limit-mib 576` gives the same counters either way (4
+clean copies given up, 832 MiB copied to the host) and the same total (0.35 s
+lazy, 0.34 s eager).
+
+## Asynchronous write-back and a copy stream per direction
+
+Until now an eviction that had to copy a modified tensor back to the host
+waited for the copy. Three changes:
+
+- `Manager::write_back(&ids)` starts the copy and returns. The tensor stays
+  resident, counts against the budget and can still be read. When the copy
+  has finished the tensor has a clean host copy, so evicting it is only a
+  free. A tensor whose copy is in flight cannot be reused until the copy
+  finishes: evicting it, unregistering it or calling `tensor_mut` waits for
+  what is left, and writing to it then discards the copy.
+- Automatic prefetch (`Config::prefetch_depth`) no longer waits for a copy
+  in either direction. It makes room only by evicting tensors that are free
+  to evict (a clean host copy, or rebuilt), in the policy's order, and only
+  if that makes enough room; otherwise it evicts nothing. It starts
+  write-backs for the tensors the policy would evict next, so they are free
+  by the time the following prefetch needs the room. An access that still
+  finds no room evicts as before, waiting if it must.
+- A copy made ahead of need (`write_back`, or the write-backs prefetch
+  starts) only takes host memory nobody is using. Under a full host limit it
+  does not start, rather than give up another tensor's clean copy. An
+  eviction that needs host memory can take back the block of a write-back,
+  finished or not.
+- Copies to the device and copies to the host run on separate streams
+  (`Config::copy_streams`, 2 by default; 1 restores the single stream).
+
+The driver reports `asyncEngineCount = 1` for this GPU
+(`tiermem::async_engine_count()`, printed by the benchmark): it runs one copy
+at a time. So no claim is made that a reload and a write-back overlap each
+other, and the measurements below agree: one stream or two makes no
+difference here.
+
+The read-only benchmark never writes back after the first spill, so
+`--dirty` marks each layer as written after it is used. Run phase only,
+30 epochs, lookahead, previous commit against this one (RTX 5080 Laptop,
+WSL2, 2026-11-12; median of 5 processes after one warmup process, nothing
+else excluded):
+
+| Work per layer | Fits in budget | No prefetch, before | No prefetch, now | `--prefetch 1`, before | `--prefetch 1`, now | now, `--copy-streams 1` |
+|---|---|---|---|---|---|---|
+| 1 kernel (~0.3 ms) | 0.12 s | 1.41 s | 1.42 s | 1.50 s | 1.63 s | 1.66 s |
+| 8 kernels (~2.7 ms) | 0.92 s | 2.26 s | 2.25 s | 1.86 s | 1.79 s | 1.74 s |
+| 32 kernels (~10 ms) | 3.57 s | 4.95 s | 5.04 s | 4.53 s | 3.85 s | 4.01 s |
+
+What this shows:
+
+- **Write-back is hidden once a layer's compute is longer than its two
+  copies.** A step moves one layer out and one in, about 5 ms together
+  because the device runs them one after the other. With 32 kernels per
+  layer (10 ms) both fit behind the compute: the run drops from 4.53 s to
+  3.85 s, and what is left above the run that fits in the budget falls from
+  0.96 s to 0.28 s.
+- **With 8 kernels per layer nothing is gained** (1.86 s before, 1.79 s
+  now, inside the variance). Before, a step cost its compute plus the copy
+  out; now it costs the two copies, which no longer wait for the compute
+  but take as long as compute plus one copy did.
+- **With almost no compute, prefetching a written workload costs time**
+  (1.63 s against 1.42 s without it, and it was 1.50 s before), because it
+  reloads more. The layer being written back keeps its slot until its copy
+  has finished, next to the slot for the incoming layer, which leaves one
+  layer resident for long instead of three: 10.8 reloads per epoch instead
+  of 8.8, and 41984 MiB moved instead of 34304. At 8 kernels per layer the
+  write-backs fall behind the prefetches, a second outgoing layer is still
+  being copied when room is needed, and every access misses: 12 reloads per
+  epoch and 46464 MiB. At 32 kernels it is 10.8 again. (This paragraph first
+  gave the 8-kernel counters as the 1-kernel ones. The traces behind the
+  correction are in issue #7.)
+- **A second stream does not help on this device.** The differences between
+  one and two streams (1.74 s and 1.79 s, 4.01 s and 3.85 s) are inside the
+  variance, as one async engine predicts.
+- Without prefetch nothing changes: an eviction forced by an access still
+  waits for its copy.
+
+The read-only benchmark, re-run the same way (run phase, 30 epochs,
+lookahead; each cell is before / now):
+
+| Work per layer | Fits in budget | No prefetch | `--prefetch 1` | `--prefetch 2` |
+|---|---|---|---|---|
+| 1 kernel | 0.12 s | 0.87 / 0.87 s | 0.85 / 0.84 s | 0.90 / 0.90 s |
+| 8 kernels | 0.92 s | 1.72 / 1.69 s | 1.13 / 1.12 s | 1.15 / 1.16 s |
+| 32 kernels | 3.74 s | 4.51 / 4.27 s | 3.84 / 3.90 s | 3.87 / 4.04 s |
+
+Nothing moved, which is the expected result: read-only layers have no
+write-backs to make asynchronous. `--prefetch 2` still matches
+`--prefetch 1`. Two reloads share the stream for copies to the device, and
+with one async engine a stream of their own would not help either; a depth
+of 2 only reloads more (320 layers against 289 over the run). Measured on the
+run phase alone, prefetching hides about 70% of the overhead at 8 and 32
+kernels per layer; the "about half" and "about 60%" above were computed on
+totals that included setup.
+
+## Measuring
+
+The benchmark now repeats itself. `--runs N` (default 5) does one warmup run
+that is not reported, then N runs, each with a fresh manager, and prints the
+median, minimum and maximum of the total, setup, run and page-locking times.
+The counters and the trace are those of the last run. A workload that cannot
+be admitted at all (`strict`) is reported once and not repeated.
+
+```
+time            0.367 s  (min 0.364, max 0.393)
+  setup         0.181 s  (min 0.181, max 0.183)
+  run           0.146 s  (min 0.145, max 0.172)
+page-locking    0.192 s  (min 0.190, max 0.218)  for 704 MiB (as first spilled)
+```
+
+The tables above were measured by running the whole process six times and
+dropping the first. The in-process medians agree with them (RTX 5080 Laptop,
+WSL2, 2026-11-12; `spill --lookahead`, median of 5 after the warmup):
+
+| | Processes | `--runs 5` |
+|---|---|---|
+| 3 epochs, total | 0.372 s | 0.367 s |
+| 3 epochs, run | 0.148 s | 0.146 s |
+| 3 epochs, run, `--host-alloc eager` | 0.086 s | 0.089 s |
+| 30 epochs, run | 0.853 s | 0.871 s |
+| 30 epochs, run, `--host-alloc eager` | 0.769 s | 0.788 s |
+
+Each run page-locks its host memory again, so the one-time costs are still
+in every run, reported on their own lines.
+
+**The copies themselves are close to the link's limit.** Taken from the trace
+of a 30-epoch run (`--lookahead --host-alloc eager --trace`), a 64 MiB
+reload takes 2.46 ms (264 reloads, 10th to 90th percentile 2.44 to 2.50 ms),
+which is 27 GB/s, and a 64 MiB copy back to the host takes 2.51 ms (272 of
+them with `--dirty`). `nvidia-smi` reports the GPU's link as PCIe 5.0 x8,
+which carries 31.5 GB/s before protocol overhead. So there is at most about
+15% left to gain from faster copies. What remains has to come from avoiding
+copies (fewer misses, clean copies) or hiding them behind compute (prefetch,
+write-back).
 
 ## Limitations
 
 - The budget is the manager's own accounting, not the driver's free-memory
   counter, and unmanaged allocations (here the two accumulators) are outside it.
 - Single GPU, single thread, `f32` tensors only in the benchmark.
-- Copying a modified tensor back to the host is still synchronous, and so is
-  rebuilding a reconstructible one; only reloads from the host are prefetched.
-- Page-locked buffers are allocated one tensor at a time, on first spill.
-  Allocating them up front, or from one arena, would move that cost out of
-  the run.
+- A modified tensor is copied back ahead of time only alongside automatic
+  prefetch or when `write_back` is called. An eviction forced by an access
+  still waits for the copy, and rebuilding a reconstructible tensor is
+  synchronous.
+- This GPU reports `asyncEngineCount = 1`: it runs one copy at a time, so
+  uploads (reloads) and write-backs cannot overlap. They take turns even on
+  separate streams. Whether they overlap on a device with more async
+  engines is untested.
+- Prefetching a workload that writes reloads more (10.8 to 12 layers per
+  epoch here instead of 8.8, see issue #7), and is slower than not
+  prefetching when a layer's compute is shorter than its copies (see the
+  `--dirty` table).
+- With `Policy::EvictLru`, a written workload gets write-backs from
+  automatic prefetch but no prefetches: the tensor written back is the one
+  the next access evicts. Seen in review, not measured in the benchmark.
+- In lazy mode a write-back started by prefetch can page-lock a block, which
+  takes as long as it would have at eviction.
+- Writing to a tensor whose write-back is in flight waits for the copy and
+  then throws it away.
+- Page-locked host memory is unlocked only when the host limit needs the
+  room for a block of another size, or when the manager is dropped. There
+  is no call to give unused blocks back.
+- The eager arena needs a host limit. With tensors of different sizes its
+  free space can end up in pieces; the manager then moves blocks together,
+  which waits for every copy in flight and copies host memory. That cost is
+  not measured: the benchmark's layers are all the same size.
+- Eager allocation moves page-locking into setup but does not make it
+  cheaper (about 0.3 ms per MiB either way).
 - A failed prefetch on the copy stream is reported by the next
   `ensure_resident` of that tensor, which leaves it spilled.
 

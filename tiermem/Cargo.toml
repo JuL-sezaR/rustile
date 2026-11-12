@@ -7,3 +7,8 @@ description = "Workload-aware GPU memory tiering: residency hints, VRAM budgets,
 
 [dependencies]
 cutile.workspace = true
+
+# The benchmark's argument parsing and run summary have unit tests.
+[[example]]
+name = "overbudget"
+test = true
