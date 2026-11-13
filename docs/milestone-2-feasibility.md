@@ -13,7 +13,8 @@ model on a Qwen3.5-0.8B backbone.
 of step b that do not depend on the model go ahead (element types beyond
 `f32`, registering tensors from host memory, residency hints), a set of basic
 tile kernels is written first, and the model for Milestone 2 is chosen after
-those kernels exist. See issue #4.
+those kernels exist. See issue #4. The spec for the kernels and for those
+manager changes is in [design/kernels.md](design/kernels.md).
 
 ## What was done
 

@@ -13,13 +13,16 @@ here.
 
 Ideas that are not implemented or not measured are in
 [NOVELTIES.md](NOVELTIES.md). The feasibility report for the next milestone
-is in [docs/milestone-2-feasibility.md](docs/milestone-2-feasibility.md).
+is in [docs/milestone-2-feasibility.md](docs/milestone-2-feasibility.md), and
+the design for the tile kernels and the manager changes they need is in
+[docs/design/kernels.md](docs/design/kernels.md).
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
 | [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
+| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax so far. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
@@ -391,6 +394,54 @@ which carries 31.5 GB/s before protocol overhead. So there is at most about
 copies (fewer misses, clean copies) or hiding them behind compute (prefetch,
 write-back).
 
+## Tile kernels
+
+`tilekernels` holds kernels written in cuTile Rust, each tested against a
+single-threaded CPU loop in `f64` (`tilekernels/src/reference.rs`). The
+design, and the order they are built in, is in
+[docs/design/kernels.md](docs/design/kernels.md). So far: softmax.
+
+### Softmax
+
+`tilekernels::softmax(&x)` normalizes each row of a `[rows, cols]` tensor.
+BF16 and F32 input give F32 output; F64 gives F64. One tile spans a whole
+row, its width rounded up to a power of two with the padding masked out, and
+up to 16 rows share a tile while it stays within 4096 elements. The tests
+hold every element to within 1e-6 of the reference for F32 output and 1e-14
+for F64.
+
+```sh
+cargo run --release -p tilekernels --example kernelbench -- softmax
+```
+
+RTX 5080 Laptop, WSL2, 2026-11-13. GPU and CPU are medians of 5 measurements
+after a warmup call, with min to max in brackets; a GPU measurement is the
+average of 20 calls, each waiting for its kernel. First call is that warmup:
+one observation per case, including the JIT compile.
+
+| Case | Tile | First call | GPU, per call | CPU reference |
+|---|---|---|---|---|
+| F32, 4096 × 1024 | 4 × 1024 | 0.22 s | 0.086 ms (0.084 to 0.095) | 19.3 ms (19.0 to 20.3) |
+| F32, 16 × 32768 | 1 × 32768 | 0.68 s | 0.077 ms (0.074 to 0.078) | 1.5 ms (1.5 to 1.7) |
+| BF16 in, 4096 × 1024 | 4 × 1024 | 0.18 s | 0.084 ms (0.082 to 0.087) | 20.4 ms (19.8 to 21.5) |
+
+What this shows:
+
+- **The GPU time does not follow the size.** 16 × 32768 has an eighth of
+  the elements of 4096 × 1024 and takes 0.077 ms against 0.086 ms, a
+  difference inside the variance. So most of the 0.08 ms is what any call
+  costs: checking the arguments, launching, and waiting for the stream. The
+  column is per-call latency; the kernel's own time is not measured here.
+- **BF16 input costs the same as F32** (0.084 against 0.086 ms).
+- **Against the CPU loop**, a call is about 220 times faster at
+  4096 × 1024 and 19 times at 16 × 32768. The CPU loop is a naive
+  single-threaded baseline in `f64`, not an optimized library, so the ratios
+  show the kernel is worth having, not how fast softmax can be.
+- **The first call is the compile**: 0.18 to 0.22 s for a 4096-element tile
+  and 0.68 s for a 32,768-element one. The first case also pays cutile's
+  check of the toolchain, which runs once per process, so its 0.22 s is not
+  directly comparable with the 0.18 s of the BF16 case.
+
 ## Limitations
 
 - The budget is the manager's own accounting, not the driver's free-memory
@@ -426,6 +477,13 @@ write-back).
   cheaper (about 0.3 ms per MiB either way).
 - A failed prefetch on the copy stream is reported by the next
   `ensure_resident` of that tensor, which leaves it spilled.
+- Softmax needs a row to fit in one tile (at most 16,777,216 columns): in
+  cutile 0.4 a block can only store its own tile, so a row cannot be reduced
+  across blocks. The first call's compile time grows with the row width
+  (0.68 s at 32,768 columns above).
+- The kernels write F32 for BF16 input; there is no BF16 output.
+- The kernels' first-call times are single observations, not medians.
+- The kernels do not run on tensors the manager holds yet.
 
 ## Building
 
@@ -433,5 +491,6 @@ Requires an NVIDIA GPU and CUDA toolkit supported by `cutile` 0.4. The cutile
 crates are pinned exactly in the workspace `Cargo.toml` because they are pre-1.0.
 
 ```sh
-cargo test -p tiermem   # runs on the GPU
+cargo test -p tiermem       # runs on the GPU
+cargo test -p tilekernels   # runs on the GPU
 ```

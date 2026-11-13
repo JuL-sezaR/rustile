@@ -1,0 +1,14 @@
+[package]
+name = "tilekernels"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Tile kernels (linear, RMSNorm, softmax, embedding gather) on cuTile Rust, with CPU references to test against."
+
+[dependencies]
+cutile.workspace = true
+
+# The benchmark's argument parsing and statistics have unit tests.
+[[example]]
+name = "kernelbench"
+test = true
