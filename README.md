@@ -412,35 +412,37 @@ for F64.
 
 ```sh
 cargo run --release -p tilekernels --example kernelbench -- softmax
+cargo run --release -p tilekernels --example kernelbench -- softmax --first-call
 ```
 
-RTX 5080 Laptop, WSL2, 2026-11-13. GPU and CPU are medians of 5 measurements
-after a warmup call, with min to max in brackets; a GPU measurement is the
-average of 20 calls, each waiting for its kernel. First call is that warmup:
-one observation per case, including the JIT compile.
+The first command measures latency per call. RTX 5080 Laptop, WSL2,
+2026-11-13. Latency and CPU are medians of 5 measurements after a warmup
+call, with min to max in brackets. A measurement is the average of 20 calls.
+Latency is end to end for one `softmax_into` call: the argument checks, the
+kernel cache lookup, the launch, and waiting for the stream. It is not the
+kernel's own time.
 
-| Case | Tile | First call | GPU, per call | CPU reference |
-|---|---|---|---|---|
-| F32, 4096 × 1024 | 4 × 1024 | 0.22 s | 0.086 ms (0.084 to 0.095) | 19.3 ms (19.0 to 20.3) |
-| F32, 16 × 32768 | 1 × 32768 | 0.68 s | 0.077 ms (0.074 to 0.078) | 1.5 ms (1.5 to 1.7) |
-| BF16 in, 4096 × 1024 | 4 × 1024 | 0.18 s | 0.084 ms (0.082 to 0.087) | 20.4 ms (19.8 to 21.5) |
+| Case | Tile | Latency per call | CPU reference |
+|---|---|---|---|
+| F32, 4096 × 1024 | 4 × 1024 | 0.086 ms (0.084 to 0.095) | 19.3 ms (19.0 to 20.3) |
+| F32, 16 × 32768 | 1 × 32768 | 0.077 ms (0.074 to 0.078) | 1.5 ms (1.5 to 1.7) |
+| BF16 in, 4096 × 1024 | 4 × 1024 | 0.084 ms (0.082 to 0.087) | 20.4 ms (19.8 to 21.5) |
 
 What this shows:
 
-- **The GPU time does not follow the size.** 16 × 32768 has an eighth of
-  the elements of 4096 × 1024 and takes 0.077 ms against 0.086 ms, a
-  difference inside the variance. So most of the 0.08 ms is what any call
-  costs: checking the arguments, launching, and waiting for the stream. The
-  column is per-call latency; the kernel's own time is not measured here.
+- **The latency does not follow the size.** 16 × 32768 has an eighth of the
+  elements of 4096 × 1024 and takes 0.077 ms against 0.086 ms, a difference
+  inside the variance. So most of the 0.08 ms is what any call costs, not
+  the kernel's work, and this column cannot say how fast the kernel itself
+  is.
 - **BF16 input costs the same as F32** (0.084 against 0.086 ms).
 - **Against the CPU loop**, a call is about 220 times faster at
   4096 × 1024 and 19 times at 16 × 32768. The CPU loop is a naive
   single-threaded baseline in `f64`, not an optimized library, so the ratios
   show the kernel is worth having, not how fast softmax can be.
-- **The first call is the compile**: 0.18 to 0.22 s for a 4096-element tile
-  and 0.68 s for a 32,768-element one. The first case also pays cutile's
-  check of the toolchain, which runs once per process, so its 0.22 s is not
-  directly comparable with the 0.18 s of the BF16 case.
+
+The first-call (compile) times of these cases are being re-measured over
+separate processes (`--first-call`) and will be added here.
 
 ## Limitations
 
@@ -479,10 +481,8 @@ What this shows:
   `ensure_resident` of that tensor, which leaves it spilled.
 - Softmax needs a row to fit in one tile (at most 16,777,216 columns): in
   cutile 0.4 a block can only store its own tile, so a row cannot be reduced
-  across blocks. The first call's compile time grows with the row width
-  (0.68 s at 32,768 columns above).
+  across blocks. The first call's compile time grows with the row width.
 - The kernels write F32 for BF16 input; there is no BF16 output.
-- The kernels' first-call times are single observations, not medians.
 - The kernels do not run on tensors the manager holds yet.
 
 ## Building
