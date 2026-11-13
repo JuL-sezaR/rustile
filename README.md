@@ -22,7 +22,7 @@ the design for the tile kernels and the manager changes they need is in
 | Crate | What it is |
 |---|---|
 | [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
-| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax and RMSNorm so far. |
+| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax, RMSNorm and embedding gather so far. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
@@ -399,7 +399,7 @@ write-back).
 `tilekernels` holds kernels written in cuTile Rust, each tested against a
 single-threaded CPU loop in `f64` (`tilekernels/src/reference.rs`). The
 design, and the order they are built in, is in
-[docs/design/kernels.md](docs/design/kernels.md). So far: softmax and RMSNorm.
+[docs/design/kernels.md](docs/design/kernels.md). So far: softmax, RMSNorm and embedding gather.
 
 ### Softmax
 
@@ -488,6 +488,45 @@ What this shows:
 - **The first call is the compile**: 0.19 to 0.21 s, steady from process to
   process, about what the softmax kernels with a 4096-element tile take.
 
+### Embedding gather
+
+`tilekernels::gather(&table, &ids)` returns the rows of a `[v, d]` table
+picked by a vector of `i32` ids, for any element type. A block copies up to
+16 ids by up to 256 columns. An id outside `0..v` gives a row of zeros: the
+ids are on the device, and checking them would cost a copy back. The tests
+compare every element bit for bit for BF16, F32, F64, I64 and U8, including
+ids just outside the table and as far out as `i32::MIN` and `i32::MAX`.
+
+```sh
+cargo run --release -p tilekernels --example kernelbench -- gather
+cargo run --release -p tilekernels --example kernelbench -- gather --first-call
+```
+
+RTX 5080 Laptop, WSL2, 2026-11-14, measured as for softmax. Each case
+gathers 4096 ids, `(i × 7919) mod 65536`, from a 65536 × 1024 table (256 MiB
+in F32).
+
+| Case | Tile | First call | Latency per call | CPU reference |
+|---|---|---|---|---|
+| F32 | 16 × 256 | 0.16 s (0.16 to 0.16) | 0.041 ms (0.039 to 0.056) | 1.9 ms (1.3 to 7.6) |
+| BF16 | 16 × 256 | 0.16 s (0.16 to 0.16) | 0.077 ms (0.064 to 0.100) | 0.5 ms (0.4 to 1.0) |
+
+What this shows:
+
+- **This is a warm gather.** Every call reads the same 4096 rows (16 MiB in
+  F32) and writes the same 16 MiB of output, so after the first call they may
+  come from the GPU's L2 cache. The latency says what a repeated gather of
+  the same rows costs, not what a gather that reads the table from memory
+  costs. Not measured: a gather with different ids on every call.
+- **BF16 against F32 is not claimed.** BF16 moves half the bytes and measured
+  higher (0.077 against 0.041 ms), with a wide spread; the cases are not
+  comparable with each other to better than about 35% (issue #12).
+- **The CPU reference is a plain row copy**, not a computation. It also
+  allocates the output on every call, and its spread is wide (1.3 to 7.6 ms
+  for F32). The ratio to it (about 46 times for F32, 6 for BF16) says little.
+- **The first call is the compile**: 0.16 s, the same in every process, a
+  little less than softmax and RMSNorm with their 4096-element tiles.
+
 ## Limitations
 
 - The budget is the manager's own accounting, not the driver's free-memory
@@ -528,6 +567,12 @@ What this shows:
   across blocks. The first call's compile time grows with the row width
   (0.20 s for a 4096-element tile, 0.80 s for 32,768).
 - The kernels write F32 for BF16 input; there is no BF16 output.
+- Gather takes `i32` ids only: cutile 0.4 cannot narrow `i64` to `i32` in a
+  kernel. An id outside the table gives a row of zeros, not an error.
+- Gather needs the whole table on the device; the manager moves whole
+  tensors, so it cannot keep only the rows in use resident.
+- The gather benchmark reads the same rows on every call, so it may measure
+  a cache-warm gather.
 - `kernelbench` cases are not comparable with each other to better than
   about 35%: one case of the RMSNorm run was 35% faster than another doing
   the same work, on the GPU and on the CPU alike. Only a case's own spread
