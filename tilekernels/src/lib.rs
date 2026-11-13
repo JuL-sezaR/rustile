@@ -4,11 +4,15 @@
 //! parts that need no GPU: the tile-shape rules ([`tiles`]) and the CPU
 //! references ([`reference`]). The kernels are added one at a time.
 
+mod kernels;
 pub mod reference;
+mod softmax;
 pub mod tiles;
 
+pub use softmax::{softmax, softmax_into};
+
 use cutile::half::bf16;
-use cutile::prelude::{DType, DeviceError};
+use cutile::prelude::{DType, DeviceError, Tensor};
 use std::fmt;
 
 #[derive(Debug)]
@@ -59,18 +63,55 @@ mod sealed {
 /// Sealed: implemented for `bf16` and `f32` (both write `f32`) and `f64`.
 pub trait Float: DType + sealed::Sealed {
     type Out: DType;
+
+    /// Launches the softmax entry for this element type. Not for callers:
+    /// use [`softmax`] and [`softmax_into`], which check the arguments.
+    #[doc(hidden)]
+    fn launch_softmax(
+        y: &mut Tensor<Self::Out>,
+        x: &Tensor<Self>,
+        bm: usize,
+        bn: usize,
+    ) -> Result<(), KernelError>;
 }
 
 impl Float for bf16 {
     type Out = f32;
+
+    fn launch_softmax(
+        y: &mut Tensor<f32>,
+        x: &Tensor<Self>,
+        bm: usize,
+        bn: usize,
+    ) -> Result<(), KernelError> {
+        softmax::launch_f32(y, x, bm, bn)
+    }
 }
 
 impl Float for f32 {
     type Out = f32;
+
+    fn launch_softmax(
+        y: &mut Tensor<f32>,
+        x: &Tensor<Self>,
+        bm: usize,
+        bn: usize,
+    ) -> Result<(), KernelError> {
+        softmax::launch_f32(y, x, bm, bn)
+    }
 }
 
 impl Float for f64 {
     type Out = f64;
+
+    fn launch_softmax(
+        y: &mut Tensor<f64>,
+        x: &Tensor<Self>,
+        bm: usize,
+        bn: usize,
+    ) -> Result<(), KernelError> {
+        softmax::launch_f64(y, x, bm, bn)
+    }
 }
 
 #[cfg(test)]

@@ -7,3 +7,8 @@ description = "Tile kernels (linear, RMSNorm, softmax, embedding gather) on cuTi
 
 [dependencies]
 cutile.workspace = true
+
+# The benchmark's argument parsing and statistics have unit tests.
+[[example]]
+name = "kernelbench"
+test = true
