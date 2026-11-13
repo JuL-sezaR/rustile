@@ -13,13 +13,16 @@ here.
 
 Ideas that are not implemented or not measured are in
 [NOVELTIES.md](NOVELTIES.md). The feasibility report for the next milestone
-is in [docs/milestone-2-feasibility.md](docs/milestone-2-feasibility.md).
+is in [docs/milestone-2-feasibility.md](docs/milestone-2-feasibility.md), and
+the design for the tile kernels and the manager changes they need is in
+[docs/design/kernels.md](docs/design/kernels.md).
 
 ## Crates
 
 | Crate | What it is |
 |---|---|
 | [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
+| [`tilekernels`](tilekernels/) | CPU references and tile-shape rules for the kernels; kernels follow. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
