@@ -31,8 +31,8 @@ Rules for whoever implements a step:
 
 | Step | State |
 |---|---|
-| 1 | Done, `f4a4d77`. |
-| 2 | Code and tests done, `0dc6dca`. README table waits for the user's `kernelbench -- softmax` numbers. |
+| 1 | Done, `ae60794`. |
+| 2 | Done: code and tests `7d64bab`, README `169bcaa`. |
 | 3 to 8 | Not started. |
 
 ## State on 2026-11-13
