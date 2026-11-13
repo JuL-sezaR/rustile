@@ -2,9 +2,9 @@
 //!
 //! ```sh
 //! # latency per call against the CPU loop
-//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm> [--runs N] [--reps R]
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather> [--runs N] [--reps R]
 //! # the first call of each case (the JIT compile), over separate processes
-//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm> --first-call [--processes N]
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather> --first-call [--processes N]
 //! ```
 //!
 //! Before anything is timed, a throwaway kernel is compiled and launched, so
@@ -30,7 +30,7 @@ use cutile::prelude::*;
 use std::hint::black_box;
 use std::process::{Command, Stdio};
 use std::time::Instant;
-use tilekernels::{Float, KernelError, reference, rmsnorm_into, softmax_into, tiles};
+use tilekernels::{Float, KernelError, gather_into, reference, rmsnorm_into, softmax_into, tiles};
 
 const DEFAULT_RUNS: usize = 5;
 const DEFAULT_REPS: usize = 20;
@@ -42,6 +42,7 @@ type BoxError = Box<dyn std::error::Error>;
 enum Kernel {
     Softmax,
     Rmsnorm,
+    Gather,
 }
 
 impl Kernel {
@@ -49,6 +50,7 @@ impl Kernel {
         match self {
             Kernel::Softmax => "softmax",
             Kernel::Rmsnorm => "rmsnorm",
+            Kernel::Gather => "gather",
         }
     }
 }
@@ -95,16 +97,17 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--first-call-child" => child = true,
             "softmax" => kernel = Some(Kernel::Softmax),
             "rmsnorm" => kernel = Some(Kernel::Rmsnorm),
+            "gather" => kernel = Some(Kernel::Gather),
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => {
                 return Err(format!(
-                    "unknown kernel {other}; available: softmax, rmsnorm"
+                    "unknown kernel {other}; available: softmax, rmsnorm, gather"
                 ));
             }
         }
     }
     let kernel = kernel.ok_or(
-        "usage: kernelbench <kernel> [--runs N] [--reps R] [--first-call [--processes N]]; kernels: softmax, rmsnorm",
+        "usage: kernelbench <kernel> [--runs N] [--reps R] [--first-call [--processes N]]; kernels: softmax, rmsnorm, gather",
     )?;
     let mode = match (first_call, child, processes) {
         (true, true, _) => {
@@ -459,6 +462,69 @@ where
     Ok(verdict.is_ok())
 }
 
+/// Compares a gather result with the reference, bit for bit. The error is the
+/// text that follows `MISMATCH <case>:`.
+fn check_exact<T: PartialEq + std::fmt::Debug>(got: &[T], want: &[T]) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("got {} values, want {}", got.len(), want.len()));
+    }
+    let wrong = got.iter().zip(want).filter(|(g, w)| g != w).count();
+    match got.iter().zip(want).position(|(g, w)| g != w) {
+        None => Ok(()),
+        Some(p) => Err(format!(
+            "{wrong} of {} elements differ, the first at {p}: got {:?}, want {:?}",
+            got.len(),
+            got[p],
+            want[p]
+        )),
+    }
+}
+
+/// One gather case: `n` ids `(i * 7919) % v` from a `[v, d]` table. As
+/// [`softmax_case`].
+fn gather_case<E>(
+    name: &str,
+    v: usize,
+    d: usize,
+    n: usize,
+    args: &Args,
+) -> Result<bool, KernelError>
+where
+    E: DType + Num + PartialEq + std::fmt::Debug,
+{
+    let (bm, bd) = tiles::gather_tiles(n, d)?;
+    let table: Vec<E> = rnd(v * d, 13).into_iter().map(E::from_f32).collect();
+    let ids: Vec<i32> = (0..n).map(|i| ((i * 7919) % v) as i32).collect();
+    let t = api::copy_host_vec_to_device(&Arc::new(table.clone()))
+        .sync()?
+        .reshape(&[v, d])?;
+    let i = api::copy_host_vec_to_device(&Arc::new(ids.clone())).sync()?;
+    let mut y = api::zeros::<E>(&[n, d]).sync()?;
+
+    let start = Instant::now();
+    gather_into(&mut y, &t, &i)?;
+    let first = start.elapsed().as_secs_f64();
+    let label = format!("gather {name} {v}x{d} {n} ids");
+    let tile = format!("{bm}x{bd}");
+    if args.mode == Mode::FirstCallChild {
+        println!("{}", child_line(&label, &tile, first));
+        return Ok(true);
+    }
+    let gpu = time_gpu(args.runs, args.reps, || gather_into(&mut y, &t, &i))?;
+    let zero = E::from_f32(0.0);
+    let cpu = time_cpu(args.runs, || reference::gather(&table, &ids, d, zero));
+
+    let got: Vec<E> = y.dup().to_host_vec().sync()?;
+    let want = reference::gather(&table, &ids, d, zero);
+    let verdict = check_exact(&got, &want);
+
+    println!("{}", format_line(&label, &tile, gpu, cpu));
+    if let Err(message) = &verdict {
+        eprintln!("MISMATCH {label}: {message}");
+    }
+    Ok(verdict.is_ok())
+}
+
 /// Starts `processes` children that each time the first call of every case.
 fn first_call(args: &Args, processes: usize) -> Result<bool, BoxError> {
     println!(
@@ -533,6 +599,11 @@ fn run(args: &Args) -> Result<bool, BoxError> {
             let mut ok = rmsnorm_case::<f32>("f32", 4096, 1024, args)?;
             ok &= rmsnorm_case::<bf16>("bf16", 4096, 1024, args)?;
             ok &= rmsnorm_case::<f32>("f32", 4096, 1000, args)?;
+            Ok(ok)
+        }
+        Kernel::Gather => {
+            let mut ok = gather_case::<f32>("f32", 65536, 1024, 4096, args)?;
+            ok &= gather_case::<bf16>("bf16", 65536, 1024, 4096, args)?;
             Ok(ok)
         }
     }
@@ -728,6 +799,24 @@ mod tests {
     fn rmsnorm_is_a_kernel() {
         assert_eq!(args(&["rmsnorm"]).unwrap().kernel, Kernel::Rmsnorm);
         assert_eq!(Kernel::Rmsnorm.name(), "rmsnorm");
+    }
+
+    #[test]
+    fn gather_is_a_kernel() {
+        assert_eq!(args(&["gather"]).unwrap().kernel, Kernel::Gather);
+        assert_eq!(Kernel::Gather.name(), "gather");
+    }
+
+    #[test]
+    fn check_exact_finds_one_wrong_element() {
+        assert!(check_exact(&[1u8, 2, 3], &[1, 2, 3]).is_ok());
+        let message = check_exact(&[1u8, 9, 3], &[1, 2, 3]).unwrap_err();
+        assert!(
+            message.starts_with("1 of 3 elements differ, the first at 1"),
+            "{message}"
+        );
+        assert!(check_exact(&[1u8, 2], &[1, 2, 3]).is_err());
+        assert!(check_exact(&[f32::NAN], &[f32::NAN]).is_err());
     }
 
     #[test]
