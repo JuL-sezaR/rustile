@@ -4,6 +4,7 @@
 #[cutile::module]
 pub(crate) mod entries {
     use cutile::core::*;
+    use cutile::tileir::*;
 
     /// Softmax along the columns. The tile spans the whole row, so the
     /// columns past the end of the tensor, which read as 0, are replaced by
@@ -98,5 +99,37 @@ pub(crate) mod entries {
         let tg: Tile<f64, { [BD] }> = g.partition(shape![BD]).load([0i32]);
         let tg: Tile<f64, { [BM, BD] }> = tg.reshape(shape![1, BD]).broadcast(y.shape());
         y.store(tx * inv * tg);
+    }
+
+    /// Embedding gather. Block `(p0, p1)` loads `BM` ids and copies columns
+    /// `p1 * BD ..` of those rows. The view pads with zeros, so an id outside
+    /// the table reads a row of zeros. Ids past the end of `ids` read as 0
+    /// (a row that exists) and the rows they produce are clipped, as are
+    /// columns past the end.
+    ///
+    /// # Safety
+    /// `table`, `ids` and `y` must stay alive and unwritten by anything else
+    /// until the launch has finished.
+    #[cutile::entry()]
+    unsafe fn gather<E: ElementType, const BM: i32, const BD: i32>(
+        y: &mut Tensor<E, { [BM, BD] }>,
+        table: &Tensor<E, { [-1, -1] }>,
+        ids: &Tensor<i32, { [-1] }>,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let tid: Tile<i32, { [BM] }> = ids.partition(shape![BM]).load([pid.0]);
+        let view: GatherScatterView<E, { [BM, BD] }, 0> =
+            unsafe { make_gather_scatter_view(table, shape![BM, BD], padding::Zero) };
+        let (t, _tok): (Tile<E, { [BM, BD] }>, Token) = unsafe {
+            load_gather_scatter_view_tko(
+                &view,
+                tid,
+                pid.1 * BD,
+                new_token_unordered(),
+                ordering::Relaxed,
+                scope::TileBlock,
+            )
+        };
+        y.store(t);
     }
 }

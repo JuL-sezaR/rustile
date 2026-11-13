@@ -1,15 +1,17 @@
 //! Tile kernels on cuTile Rust, and the CPU code they are tested against.
 //!
 //! The design is in `docs/design/kernels.md`. The kernels are added one at a
-//! time; so far there are [`softmax`] and [`rmsnorm`]. The tile-shape rules are in [`tiles`]
+//! time; so far there are [`softmax`], [`rmsnorm`] and [`gather`]. The tile-shape rules are in [`tiles`]
 //! and the CPU references the kernels are tested against in [`reference`](mod@reference).
 
+mod gather;
 mod kernels;
 pub mod reference;
 mod rmsnorm;
 mod softmax;
 pub mod tiles;
 
+pub use gather::{gather, gather_into, gather_into_with_tiles};
 pub use rmsnorm::{rmsnorm, rmsnorm_into};
 pub use softmax::{softmax, softmax_into};
 
