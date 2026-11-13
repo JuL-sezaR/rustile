@@ -18,6 +18,21 @@ Rules for whoever implements a step:
   model's.
 - Run only the tests of the step while working, and the full suite
   (`cargo test --workspace`) once before committing.
+- Do not run `kernelbench` or `overbudget`, not even once with `--runs 1` to
+  see that it starts. Hand over the command; the user's run is the first run.
+- Commit locally on the `tile-kernels` branch. Never push and never open a
+  pull request; the user reads everything and pushes. Commit messages carry
+  no `Co-Authored-By` line.
+- A step that has a benchmark is two commits: the code and tests first, then
+  the README once the user has pasted the numbers.
+
+## Progress
+
+| Step | State |
+|---|---|
+| 1 | Done, `f4a4d77`. |
+| 2 | Code and tests done, `0dc6dca`. README table waits for the user's `kernelbench -- softmax` numbers. |
+| 3 to 8 | Not started. |
 
 ## State on 2026-11-13
 
@@ -107,10 +122,14 @@ running on managed tensors.
 tilekernels/
   Cargo.toml            name = "tilekernels", cutile.workspace = true,
                         edition/license from the workspace
-  src/lib.rs            public API, KernelError, the Float trait
+  src/lib.rs            KernelError, the Float trait, re-exports
   src/tiles.rs          tile-shape rules (pure functions)
   src/reference.rs      CPU references (pure functions)
-  src/kernels.rs        the #[cutile::module] with the DSL entries
+  src/kernels.rs        `#[cutile::module] pub(crate) mod entries` with every
+                        DSL entry
+  src/softmax.rs        one file per kernel (then rmsnorm.rs, gather.rs,
+                        linear.rs): the public wrappers, the shape checks and
+                        the `launch_*` functions that call `entries`
   tests/common/mod.rs   shared test helpers
   tests/softmax.rs, rmsnorm.rs, gather.rs, linear.rs
   examples/kernelbench.rs
@@ -160,9 +179,11 @@ kernels::softmax_f32((&mut *y).partition([bm, bn]), x)
 ```
 
 The kernels for F64 are separate, non-generic entries (`*_f64`), because the
-accumulator type and the constants differ. How a wrapper picks the entry for
-`E` is up to the implementer (a private method on the sealed trait is the
-obvious way).
+accumulator type and the constants differ. A wrapper picks the entry for `E`
+through a `#[doc(hidden)]` method on `Float`, one per computing kernel, as
+step 2 did with `launch_softmax` (decision 1 under "Open questions"). Steps 3
+and 5 add `launch_rmsnorm` and `launch_linear` the same way. Gather needs
+none: it has one entry, generic over any `DType`.
 
 ### Tile-shape rules (`tiles.rs`)
 
@@ -790,5 +811,35 @@ step 6 needs them once on the commit before the change and once after.
 
 ## Open questions
 
-None yet. An implementer who is blocked writes the question here, with the
+None open. An implementer who is blocked writes the question here, with the
 exact error text and what was tried, and stops.
+
+### Answered
+
+Nobody was blocked in steps 1 and 2 and nothing was written here. These are
+the points the hand-backs of those steps raised, with the decision for each,
+so later steps do not have to ask.
+
+1. **`Float` has a public, hidden `launch_softmax` method, where the spec
+   said "a private method on the sealed trait".** Accepted as built. The
+   sealed trait cannot name `Float::Out`, so the method has to sit on
+   `Float`; the trait is sealed, so no other crate can implement it, and the
+   method is `#[doc(hidden)]`. Later computing kernels do the same. The
+   "Common API" section now says this.
+2. **`kernelbench` has its own copy of the xorshift generator, of the `Num`
+   conversion trait and of the softmax tolerance,** because an example cannot
+   use `tests/common`. Accepted. Do not move them into the library's public
+   API to share them. Each later step adds its tolerance to the example the
+   same way, with the same numbers as the "Tolerances" table.
+3. **The example was never run end to end** (a `--runs 1 --reps 1` smoke run
+   was refused, in line with the rule that the user runs benchmarks).
+   Accepted, and now a rule at the top: do not try. If the user's run prints
+   `MISMATCH`, exits non-zero without one, or prints a line that does not
+   match the documented format, that is a bug in the step: fix it with a
+   test before the README commit.
+4. **Does the README section for step 2 go in before the numbers?** No. The
+   code commit comes first and the README commit after the numbers, as the
+   rules at the top now say.
+5. **`wide_row` measured 21.5 s including the first compile** (max error
+   `3.0e-11`), in a debug test build, once. Step 2's README limitation may
+   quote it as a single observation of the first call, not as a median.
