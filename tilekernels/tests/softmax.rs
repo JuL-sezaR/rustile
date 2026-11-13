@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Num, dev, from_f32s, host, max_abs_err, rnd, to_f64s};
+use common::{Num, dev, from_f32s, host, max_abs_err, rnd, to_f64s, worst};
 use cutile::api;
 use cutile::half::bf16;
 use cutile::prelude::*;
@@ -31,10 +31,10 @@ where
     let want = reference::softmax(&to_f64s(xs), rows, cols);
     let (tol, sum_tol) = tolerance::<E>();
     let err = max_abs_err(&got, &want);
-    let sum_err = got
-        .chunks(cols)
-        .map(|row| (row.iter().sum::<f64>() - 1.0).abs())
-        .fold(0.0, f64::max);
+    let sum_err = worst(
+        got.chunks(cols)
+            .map(|row| (row.iter().sum::<f64>() - 1.0).abs()),
+    );
     println!("{label} {rows}x{cols}: max error {err:e}, worst row sum error {sum_err:e}");
     assert!(err <= tol, "{label} {rows}x{cols}: error {err:e} > {tol:e}");
     assert!(
@@ -42,6 +42,14 @@ where
         "{label} {rows}x{cols}: row sum error {sum_err:e} > {sum_tol:e}"
     );
     got
+}
+
+#[test]
+fn the_error_helpers_do_not_hide_a_nan() {
+    assert!(max_abs_err(&[1.0, f64::NAN], &[1.0, 1.0]).is_nan());
+    assert!(max_abs_err(&[f64::NAN, 1.0], &[1.0, 1.0]).is_nan());
+    assert!(worst([0.5, f64::NAN, 0.1].into_iter()).is_nan());
+    assert_eq!(max_abs_err(&[1.0, 3.0], &[1.5, 1.0]), 2.0);
 }
 
 fn random<E: Num>(rows: usize, cols: usize, seed: u64) -> Vec<E> {
