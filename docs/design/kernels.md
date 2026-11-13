@@ -20,9 +20,10 @@ Rules for whoever implements a step:
   (`cargo test --workspace`) once before committing.
 - Do not run `kernelbench` or `overbudget`, not even once with `--runs 1` to
   see that it starts. Hand over the command; the user's run is the first run.
-- Commit locally on the `tile-kernels` branch. Never push and never open a
-  pull request; the user reads everything and pushes. Commit messages carry
-  no `Co-Authored-By` line.
+- Work on the `tile-kernels` branch. When a file is finished, commit it with
+  a brief, simple message and push the branch. Do not push to `main` or open
+  a pull request unless asked. Commit messages carry no `Co-Authored-By`
+  line.
 - A step that has a benchmark is two commits: the code and tests first, then
   the README once the user has pasted the numbers.
 
