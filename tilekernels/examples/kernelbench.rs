@@ -2,9 +2,9 @@
 //!
 //! ```sh
 //! # latency per call against the CPU loop
-//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather> [--runs N] [--reps R]
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather|linear> [--runs N] [--reps R]
 //! # the first call of each case (the JIT compile), over separate processes
-//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather> --first-call [--processes N]
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather|linear> --first-call [--processes N]
 //! ```
 //!
 //! Before anything is timed, a throwaway kernel is compiled and launched, so
@@ -30,7 +30,10 @@ use cutile::prelude::*;
 use std::hint::black_box;
 use std::process::{Command, Stdio};
 use std::time::Instant;
-use tilekernels::{Float, KernelError, gather_into, reference, rmsnorm_into, softmax_into, tiles};
+use tilekernels::tiles::LinearTiles;
+use tilekernels::{
+    Float, KernelError, gather_into, linear_into, reference, rmsnorm_into, softmax_into, tiles,
+};
 
 const DEFAULT_RUNS: usize = 5;
 const DEFAULT_REPS: usize = 20;
@@ -43,6 +46,7 @@ enum Kernel {
     Softmax,
     Rmsnorm,
     Gather,
+    Linear,
 }
 
 impl Kernel {
@@ -51,6 +55,7 @@ impl Kernel {
             Kernel::Softmax => "softmax",
             Kernel::Rmsnorm => "rmsnorm",
             Kernel::Gather => "gather",
+            Kernel::Linear => "linear",
         }
     }
 }
@@ -98,16 +103,17 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "softmax" => kernel = Some(Kernel::Softmax),
             "rmsnorm" => kernel = Some(Kernel::Rmsnorm),
             "gather" => kernel = Some(Kernel::Gather),
+            "linear" => kernel = Some(Kernel::Linear),
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
             other => {
                 return Err(format!(
-                    "unknown kernel {other}; available: softmax, rmsnorm, gather"
+                    "unknown kernel {other}; available: softmax, rmsnorm, gather, linear"
                 ));
             }
         }
     }
     let kernel = kernel.ok_or(
-        "usage: kernelbench <kernel> [--runs N] [--reps R] [--first-call [--processes N]]; kernels: softmax, rmsnorm, gather",
+        "usage: kernelbench <kernel> [--runs N] [--reps R] [--first-call [--processes N]]; kernels: softmax, rmsnorm, gather, linear",
     )?;
     let mode = match (first_call, child, processes) {
         (true, true, _) => {
@@ -525,6 +531,142 @@ where
     Ok(verdict.is_ok())
 }
 
+/// The linear test tolerance for this output type: the limit for an element
+/// is `factor * scale + tiny`, where `scale` is the sum of the magnitudes of
+/// its terms.
+fn linear_tolerance<E: Float>() -> (f64, f64) {
+    if <E::Out as DType>::DTYPE == DTypeId::F64 {
+        (16.0 * 2f64.powi(-53), 1e-300)
+    } else {
+        (16.0 * 2f64.powi(-24), 1e-30)
+    }
+}
+
+/// Compares a linear result with the reference, each element within
+/// `factor * scale + tiny`. The error is the text that follows
+/// `MISMATCH <case>:`.
+fn check_scaled(
+    got: &[f64],
+    want: &[f64],
+    scale: &[f64],
+    factor: f64,
+    tiny: f64,
+) -> Result<(), String> {
+    if got.len() != want.len() || scale.len() != want.len() {
+        return Err(format!(
+            "got {} values, want {} with {} scales",
+            got.len(),
+            want.len(),
+            scale.len()
+        ));
+    }
+    let err = worst(got.iter().zip(want).map(|(g, w)| (g - w).abs()));
+    let ratio = worst(
+        got.iter()
+            .zip(want)
+            .zip(scale)
+            .map(|((g, w), s)| (g - w).abs() / (factor * s + tiny)),
+    );
+    // Written so that NaN fails.
+    if ratio <= 1.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "max error {err:e}, worst element {ratio:.3} times its limit"
+        ))
+    }
+}
+
+fn tile_name(t: LinearTiles, default: LinearTiles) -> String {
+    let name = format!("{}x{}x{}", t.bm, t.bn, t.bk);
+    if t == default {
+        format!("{name} (default)")
+    } else {
+        name
+    }
+}
+
+/// The linear cases for one shape: `x: [m, k]`, `w: [n, k]`, with a bias. The
+/// default tile first, then each of `sweep` that differs from it. The inputs,
+/// the CPU timing and the reference are made once and shared by the tiles,
+/// since none of them depends on the tile. Otherwise as [`softmax_case`].
+fn linear_cases<E>(
+    name: &str,
+    (m, k, n): (usize, usize, usize),
+    sweep: &[LinearTiles],
+    args: &Args,
+) -> Result<bool, KernelError>
+where
+    E: Float + Num,
+    E::Out: Num,
+{
+    let default = LinearTiles::for_shape(m, k, n)?;
+    let mut tiles = vec![default];
+    tiles.extend(sweep.iter().copied().filter(|&t| t != default));
+
+    let xs: Vec<E> = rnd(m * k, 1).into_iter().map(E::from_f32).collect();
+    let ws: Vec<E> = rnd(n * k, 2).into_iter().map(E::from_f32).collect();
+    let bs: Vec<E::Out> = rnd(n, 3)
+        .into_iter()
+        .map(<E::Out as Num>::from_f32)
+        .collect();
+    let upload = |v: Vec<E>, shape: &[usize]| -> Result<Tensor<E>, KernelError> {
+        Ok(api::copy_host_vec_to_device(&Arc::new(v))
+            .sync()?
+            .reshape(shape)?)
+    };
+    let x = upload(xs.clone(), &[m, k])?;
+    let w = upload(ws.clone(), &[n, k])?;
+    let b = api::copy_host_vec_to_device(&Arc::new(bs.clone())).sync()?;
+    let mut y = api::zeros::<E::Out>(&[m, n]).sync()?;
+    let label = format!("linear {name} {m}x{k}x{n}");
+
+    if args.mode == Mode::FirstCallChild {
+        for &t in &tiles {
+            let start = Instant::now();
+            linear_into(&mut y, &x, &w, Some(&b), t)?;
+            let first = start.elapsed().as_secs_f64();
+            println!("{}", child_line(&label, &tile_name(t, default), first));
+        }
+        return Ok(true);
+    }
+
+    let xs64: Vec<f64> = xs.iter().map(|&v| v.to_f64()).collect();
+    let ws64: Vec<f64> = ws.iter().map(|&v| v.to_f64()).collect();
+    let bs64: Vec<f64> = bs.iter().map(|&v| v.to_f64()).collect();
+    let cpu = time_cpu(args.runs, || {
+        reference::linear(&xs64, &ws64, Some(&bs64), m, k, n)
+    });
+    let (want, scale) = reference::linear(&xs64, &ws64, Some(&bs64), m, k, n);
+    let (factor, tiny) = linear_tolerance::<E>();
+
+    let mut ok = true;
+    for &t in &tiles {
+        // the warmup, which includes the compile
+        linear_into(&mut y, &x, &w, Some(&b), t)?;
+        let gpu = time_gpu(args.runs, args.reps, || {
+            linear_into(&mut y, &x, &w, Some(&b), t)
+        })?;
+        let got: Vec<f64> = y
+            .dup()
+            .to_host_vec()
+            .sync()?
+            .into_iter()
+            .map(Num::to_f64)
+            .collect();
+        let verdict = check_scaled(&got, &want, &scale, factor, tiny);
+        println!("{}", format_line(&label, &tile_name(t, default), gpu, cpu));
+        if let Err(message) = &verdict {
+            eprintln!(
+                "MISMATCH {label} tiles {}: {message}",
+                tile_name(t, default)
+            );
+            ok = false;
+        }
+    }
+    Ok(ok)
+}
+
 /// Starts `processes` children that each time the first call of every case.
 fn first_call(args: &Args, processes: usize) -> Result<bool, BoxError> {
     println!(
@@ -606,6 +748,15 @@ fn run(args: &Args) -> Result<bool, BoxError> {
             ok &= gather_case::<bf16>("bf16", 65536, 1024, 4096, args)?;
             Ok(ok)
         }
+        Kernel::Linear => {
+            let sweep = [(16, 16, 16), (32, 32, 32), (64, 64, 32), (64, 64, 64)]
+                .map(|(bm, bn, bk)| LinearTiles { bm, bn, bk });
+            let mut ok = linear_cases::<f32>("f32", (256, 1024, 4096), &sweep, args)?;
+            ok &= linear_cases::<bf16>("bf16", (256, 1024, 4096), &[], args)?;
+            ok &= linear_cases::<f32>("f32", (100, 1000, 3000), &[], args)?;
+            ok &= linear_cases::<f32>("f32", (1, 1024, 4096), &[], args)?;
+            Ok(ok)
+        }
     }
 }
 
@@ -670,7 +821,7 @@ mod tests {
     #[test]
     fn bad_arguments_are_rejected() {
         assert!(args(&[]).unwrap_err().contains("usage"));
-        assert!(args(&["linear"]).unwrap_err().contains("unknown kernel"));
+        assert!(args(&["matmul"]).unwrap_err().contains("unknown kernel"));
         assert!(
             args(&["softmax", "--bogus"])
                 .unwrap_err()
@@ -817,6 +968,52 @@ mod tests {
         );
         assert!(check_exact(&[1u8, 2], &[1, 2, 3]).is_err());
         assert!(check_exact(&[f32::NAN], &[f32::NAN]).is_err());
+    }
+
+    #[test]
+    fn linear_is_a_kernel() {
+        assert_eq!(args(&["linear"]).unwrap().kernel, Kernel::Linear);
+        assert_eq!(Kernel::Linear.name(), "linear");
+    }
+
+    #[test]
+    fn check_scaled_scales_the_limit_per_element() {
+        let want = [10.0, 0.0];
+        let scale = [100.0, 1.0];
+        // 1e-3 off is outside 1e-6 * 100 = 1e-4
+        assert!(check_scaled(&[10.001, 0.0], &want, &scale, 1e-6, 1e-30).is_err());
+        // 5e-5 off is inside it
+        assert!(check_scaled(&[10.00005, 0.0], &want, &scale, 1e-6, 1e-30).is_ok());
+        // the same 5e-5 on an element of scale 1 is outside 1e-6
+        let message = check_scaled(&[10.0, 0.00005], &want, &scale, 1e-6, 1e-30).unwrap_err();
+        assert!(message.starts_with("max error "), "{message}");
+    }
+
+    #[test]
+    fn check_scaled_fails_on_nan_and_a_wrong_length() {
+        assert!(check_scaled(&[f64::NAN], &[1.0], &[1.0], 1e-6, 1e-30).is_err());
+        assert!(check_scaled(&[1.0], &[1.0, 2.0], &[1.0, 1.0], 1e-6, 1e-30).is_err());
+    }
+
+    #[test]
+    fn the_default_tile_is_marked_in_the_sweep() {
+        let d = LinearTiles {
+            bm: 64,
+            bn: 64,
+            bk: 32,
+        };
+        assert_eq!(tile_name(d, d), "64x64x32 (default)");
+        assert_eq!(
+            tile_name(
+                LinearTiles {
+                    bm: 16,
+                    bn: 16,
+                    bk: 16
+                },
+                d
+            ),
+            "16x16x16"
+        );
     }
 
     #[test]
