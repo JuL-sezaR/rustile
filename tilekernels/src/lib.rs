@@ -12,7 +12,7 @@ pub mod tiles;
 pub use softmax::{softmax, softmax_into};
 
 use cutile::half::bf16;
-use cutile::prelude::{DType, DeviceError, Tensor};
+use cutile::prelude::{DeviceError, Tensor};
 use std::fmt;
 
 #[derive(Debug)]
@@ -53,29 +53,38 @@ impl From<DeviceError> for KernelError {
 }
 
 mod sealed {
-    pub trait Sealed {}
-    impl Sealed for cutile::half::bf16 {}
-    impl Sealed for f32 {}
-    impl Sealed for f64 {}
+    use super::KernelError;
+    use cutile::prelude::{DType, Tensor};
+
+    /// What the kernels need from an element type and callers do not. It
+    /// lives in a module no other crate can name, which seals [`Float`] and
+    /// keeps the launch methods crate-private.
+    ///
+    /// [`Float`]: super::Float
+    pub trait Sealed: DType {
+        /// The type the kernels write for this input type.
+        type Out: DType;
+
+        /// Launches the softmax entry for this element type, with no
+        /// checks: `y` and `x` must have the same 2-D shape and `bm`, `bn`
+        /// must be the tile from `tiles::row_tiles` for it.
+        fn launch_softmax(
+            y: &mut Tensor<Self::Out>,
+            x: &Tensor<Self>,
+            bm: usize,
+            bn: usize,
+        ) -> Result<(), KernelError>;
+    }
 }
 
-/// Element types the computing kernels accept, with the type they write.
-/// Sealed: implemented for `bf16` and `f32` (both write `f32`) and `f64`.
-pub trait Float: DType + sealed::Sealed {
-    type Out: DType;
+/// Element types the computing kernels accept: `bf16` and `f32`, which both
+/// write `f32`, and `f64`, which writes `f64`. The type written is
+/// `<E as Float>::Out`. Sealed: no other type can implement it.
+pub trait Float: sealed::Sealed {}
 
-    /// Launches the softmax entry for this element type. Not for callers:
-    /// use [`softmax`] and [`softmax_into`], which check the arguments.
-    #[doc(hidden)]
-    fn launch_softmax(
-        y: &mut Tensor<Self::Out>,
-        x: &Tensor<Self>,
-        bm: usize,
-        bn: usize,
-    ) -> Result<(), KernelError>;
-}
+impl<T: sealed::Sealed> Float for T {}
 
-impl Float for bf16 {
+impl sealed::Sealed for bf16 {
     type Out = f32;
 
     fn launch_softmax(
@@ -88,7 +97,7 @@ impl Float for bf16 {
     }
 }
 
-impl Float for f32 {
+impl sealed::Sealed for f32 {
     type Out = f32;
 
     fn launch_softmax(
@@ -101,7 +110,7 @@ impl Float for f32 {
     }
 }
 
-impl Float for f64 {
+impl sealed::Sealed for f64 {
     type Out = f64;
 
     fn launch_softmax(
@@ -118,6 +127,7 @@ impl Float for f64 {
 mod tests {
     use super::*;
     use cutile::DTypeId;
+    use cutile::prelude::DType;
 
     fn out_dtype<E: Float>() -> DTypeId {
         <E::Out as DType>::DTYPE
