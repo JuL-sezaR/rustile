@@ -35,7 +35,8 @@ Rules for whoever implements a step:
 | 2 | Done: code, tests, review fixes and README table. |
 | 3 | Done: code, tests and README table. |
 | 4 | Done: code, tests and README table. |
-| 5 to 8 | Not started. |
+| 5 | Done: code, tests and README table. The tile sweep kept the default 64 × 64 × 32 (32 × 32 × 32 was 3% slower, 16³ and 64 × 64 × 64 about twice as slow). |
+| 6 to 8 | Not started. |
 
 ## State on 2026-11-13
 
