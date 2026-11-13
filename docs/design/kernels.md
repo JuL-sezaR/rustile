@@ -34,7 +34,8 @@ Rules for whoever implements a step:
 | 1 | Done, `ae60794`. |
 | 2 | Done: code, tests, review fixes and README table. |
 | 3 | Done: code, tests and README table. |
-| 4 to 8 | Not started. |
+| 4 | Done: code, tests and README table. |
+| 5 to 8 | Not started. |
 
 ## State on 2026-11-13
 
