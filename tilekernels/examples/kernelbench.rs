@@ -2,9 +2,9 @@
 //!
 //! ```sh
 //! # latency per call against the CPU loop
-//! cargo run --release -p tilekernels --example kernelbench -- softmax [--runs N] [--reps R]
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm> [--runs N] [--reps R]
 //! # the first call of each case (the JIT compile), over separate processes
-//! cargo run --release -p tilekernels --example kernelbench -- softmax --first-call [--processes N]
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm> --first-call [--processes N]
 //! ```
 //!
 //! Before anything is timed, a throwaway kernel is compiled and launched, so
@@ -30,7 +30,7 @@ use cutile::prelude::*;
 use std::hint::black_box;
 use std::process::{Command, Stdio};
 use std::time::Instant;
-use tilekernels::{Float, KernelError, reference, softmax_into, tiles};
+use tilekernels::{Float, KernelError, reference, rmsnorm_into, softmax_into, tiles};
 
 const DEFAULT_RUNS: usize = 5;
 const DEFAULT_REPS: usize = 20;
@@ -41,12 +41,14 @@ type BoxError = Box<dyn std::error::Error>;
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kernel {
     Softmax,
+    Rmsnorm,
 }
 
 impl Kernel {
     fn name(self) -> &'static str {
         match self {
             Kernel::Softmax => "softmax",
+            Kernel::Rmsnorm => "rmsnorm",
         }
     }
 }
@@ -92,12 +94,17 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--first-call" => first_call = true,
             "--first-call-child" => child = true,
             "softmax" => kernel = Some(Kernel::Softmax),
+            "rmsnorm" => kernel = Some(Kernel::Rmsnorm),
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
-            other => return Err(format!("unknown kernel {other}; available: softmax")),
+            other => {
+                return Err(format!(
+                    "unknown kernel {other}; available: softmax, rmsnorm"
+                ));
+            }
         }
     }
     let kernel = kernel.ok_or(
-        "usage: kernelbench <kernel> [--runs N] [--reps R] [--first-call [--processes N]]; kernels: softmax",
+        "usage: kernelbench <kernel> [--runs N] [--reps R] [--first-call [--processes N]]; kernels: softmax, rmsnorm",
     )?;
     let mode = match (first_call, child, processes) {
         (true, true, _) => {
@@ -371,6 +378,87 @@ where
     Ok(verdict.is_ok())
 }
 
+/// The RMSNorm test tolerance for this output type: `abs + rel * |want|`.
+fn rmsnorm_tolerance<E: Float>() -> (f64, f64) {
+    if <E::Out as DType>::DTYPE == DTypeId::F64 {
+        (1e-12, 1e-12)
+    } else {
+        (1e-6, 1e-5)
+    }
+}
+
+/// Compares a result with the reference, element by element, within
+/// `abs + rel * |want|`. The error is the text that follows
+/// `MISMATCH <case>:`.
+fn check_close(got: &[f64], want: &[f64], abs: f64, rel: f64) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("got {} values, want {}", got.len(), want.len()));
+    }
+    let err = worst(got.iter().zip(want).map(|(g, w)| (g - w).abs()));
+    let ratio = worst(
+        got.iter()
+            .zip(want)
+            .map(|(g, w)| (g - w).abs() / (abs + rel * w.abs())),
+    );
+    // Written so that NaN fails.
+    if ratio <= 1.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "max error {err:e}, worst element {ratio:.3} times its limit (abs {abs:e} + rel {rel:e})"
+        ))
+    }
+}
+
+/// One RMSNorm case, with `eps = 1e-6`. As [`softmax_case`].
+fn rmsnorm_case<E>(name: &str, rows: usize, d: usize, args: &Args) -> Result<bool, KernelError>
+where
+    E: Float + Num,
+    E::Out: Num,
+{
+    const EPS: f64 = 1e-6;
+    let (bm, bd) = tiles::row_tiles(rows, d)?;
+    let xs: Vec<E> = rnd(rows * d, 11).into_iter().map(E::from_f32).collect();
+    let gs: Vec<E> = rnd(d, 12).into_iter().map(E::from_f32).collect();
+    let x = api::copy_host_vec_to_device(&Arc::new(xs.clone()))
+        .sync()?
+        .reshape(&[rows, d])?;
+    let g = api::copy_host_vec_to_device(&Arc::new(gs.clone())).sync()?;
+    let mut y = api::zeros::<E::Out>(&[rows, d]).sync()?;
+
+    let start = Instant::now();
+    rmsnorm_into(&mut y, &x, &g, EPS)?;
+    let first = start.elapsed().as_secs_f64();
+    let label = format!("rmsnorm {name} {rows}x{d}");
+    let tile = format!("{bm}x{bd}");
+    if args.mode == Mode::FirstCallChild {
+        println!("{}", child_line(&label, &tile, first));
+        return Ok(true);
+    }
+    let gpu = time_gpu(args.runs, args.reps, || rmsnorm_into(&mut y, &x, &g, EPS))?;
+
+    let xs64: Vec<f64> = xs.iter().map(|&v| v.to_f64()).collect();
+    let gs64: Vec<f64> = gs.iter().map(|&v| v.to_f64()).collect();
+    let cpu = time_cpu(args.runs, || reference::rmsnorm(&xs64, &gs64, rows, d, EPS));
+
+    let got: Vec<f64> = y
+        .dup()
+        .to_host_vec()
+        .sync()?
+        .into_iter()
+        .map(Num::to_f64)
+        .collect();
+    let want = reference::rmsnorm(&xs64, &gs64, rows, d, EPS);
+    let (abs, rel) = rmsnorm_tolerance::<E>();
+    let verdict = check_close(&got, &want, abs, rel);
+
+    println!("{}", format_line(&label, &tile, gpu, cpu));
+    if let Err(message) = &verdict {
+        eprintln!("MISMATCH {label}: {message}");
+    }
+    Ok(verdict.is_ok())
+}
+
 /// Starts `processes` children that each time the first call of every case.
 fn first_call(args: &Args, processes: usize) -> Result<bool, BoxError> {
     println!(
@@ -441,6 +529,12 @@ fn run(args: &Args) -> Result<bool, BoxError> {
             ok &= softmax_case::<bf16>("bf16", 4096, 1024, args)?;
             Ok(ok)
         }
+        Kernel::Rmsnorm => {
+            let mut ok = rmsnorm_case::<f32>("f32", 4096, 1024, args)?;
+            ok &= rmsnorm_case::<bf16>("bf16", 4096, 1024, args)?;
+            ok &= rmsnorm_case::<f32>("f32", 4096, 1000, args)?;
+            Ok(ok)
+        }
     }
 }
 
@@ -505,7 +599,7 @@ mod tests {
     #[test]
     fn bad_arguments_are_rejected() {
         assert!(args(&[]).unwrap_err().contains("usage"));
-        assert!(args(&["rmsnorm"]).unwrap_err().contains("unknown kernel"));
+        assert!(args(&["linear"]).unwrap_err().contains("unknown kernel"));
         assert!(
             args(&["softmax", "--bogus"])
                 .unwrap_err()
@@ -628,6 +722,29 @@ mod tests {
             ),
             "softmax f32 4096x1024 tiles 4x1024: first call 0.22 s (min 0.20, max 0.30) over 5 processes"
         );
+    }
+
+    #[test]
+    fn rmsnorm_is_a_kernel() {
+        assert_eq!(args(&["rmsnorm"]).unwrap().kernel, Kernel::Rmsnorm);
+        assert_eq!(Kernel::Rmsnorm.name(), "rmsnorm");
+    }
+
+    #[test]
+    fn check_close_allows_the_relative_part_of_the_limit() {
+        let want = [1000.0, 0.001];
+        // 4e-3 off at 1000 is inside 1e-6 + 1e-5 * 1000 = 0.010001
+        assert!(check_close(&[1000.004, 0.001], &want, 1e-6, 1e-5).is_ok());
+        // the same error at 0.001 is far outside 1e-6 + 1e-8
+        let message = check_close(&[1000.0, 0.005], &want, 1e-6, 1e-5).unwrap_err();
+        assert!(message.starts_with("max error "), "{message}");
+    }
+
+    #[test]
+    fn check_close_fails_on_nan_and_a_wrong_length() {
+        assert!(check_close(&[f64::NAN, 1.0], &[1.0, 1.0], 1e-6, 1e-5).is_err());
+        assert!(check_close(&[1.0], &[1.0, 1.0], 1e-6, 1e-5).is_err());
+        assert!(check_close(&[1.0, 2.0], &[1.0, 2.0], 1e-6, 1e-5).is_ok());
     }
 
     fn softmax_row() -> Vec<f64> {
