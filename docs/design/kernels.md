@@ -32,7 +32,7 @@ Rules for whoever implements a step:
 | Step | State |
 |---|---|
 | 1 | Done, `ae60794`. |
-| 2 | Code, tests and review fixes done. README waits for the user's `softmax` and `softmax --first-call` numbers. |
+| 2 | Done: code, tests, review fixes and README table. |
 | 3 to 8 | Not started. |
 
 ## State on 2026-11-13
