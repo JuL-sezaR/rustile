@@ -1,18 +1,8 @@
 //! Softmax along the columns of a `[rows, cols]` tensor.
 
 use crate::kernels::entries;
-use crate::{Float, KernelError, tiles};
+use crate::{Float, KernelError, dims_2d, tiles};
 use cutile::prelude::*;
-
-/// The `[rows, cols]` of a 2-D tensor.
-fn dims_2d(name: &str, shape: &[i32]) -> Result<(usize, usize), KernelError> {
-    match shape {
-        [rows, cols] => Ok((*rows as usize, *cols as usize)),
-        _ => Err(KernelError::shape(format!(
-            "{name} must be 2-D, got shape {shape:?}"
-        ))),
-    }
-}
 
 /// `y[i][j] = exp(x[i][j] - max_j) / sum_j exp(x[i][j] - max_j)`, for BF16 or
 /// F32 input (F32 output) or F64 input (F64 output). The result is a new

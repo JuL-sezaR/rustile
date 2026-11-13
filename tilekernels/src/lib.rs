@@ -1,14 +1,16 @@
 //! Tile kernels on cuTile Rust, and the CPU code they are tested against.
 //!
 //! The design is in `docs/design/kernels.md`. The kernels are added one at a
-//! time; so far there is [`softmax`]. The tile-shape rules are in [`tiles`]
+//! time; so far there are [`softmax`] and [`rmsnorm`]. The tile-shape rules are in [`tiles`]
 //! and the CPU references the kernels are tested against in [`reference`](mod@reference).
 
 mod kernels;
 pub mod reference;
+mod rmsnorm;
 mod softmax;
 pub mod tiles;
 
+pub use rmsnorm::{rmsnorm, rmsnorm_into};
 pub use softmax::{softmax, softmax_into};
 
 use cutile::half::bf16;
@@ -26,6 +28,16 @@ pub enum KernelError {
 impl KernelError {
     pub(crate) fn shape(message: impl Into<String>) -> Self {
         KernelError::Shape(message.into())
+    }
+}
+
+/// The `[rows, cols]` of a 2-D tensor.
+pub(crate) fn dims_2d(name: &str, shape: &[i32]) -> Result<(usize, usize), KernelError> {
+    match shape {
+        [rows, cols] => Ok((*rows as usize, *cols as usize)),
+        _ => Err(KernelError::shape(format!(
+            "{name} must be 2-D, got shape {shape:?}"
+        ))),
     }
 }
 
@@ -74,6 +86,18 @@ mod sealed {
             bm: usize,
             bn: usize,
         ) -> Result<(), KernelError>;
+
+        /// Launches the RMSNorm entry, with no checks: `y` and `x` must have
+        /// the same 2-D shape, `gain` one element per column, and `bm`, `bd`
+        /// must be the tile from `tiles::row_tiles` for it.
+        fn launch_rmsnorm(
+            y: &mut Tensor<Self::Out>,
+            x: &Tensor<Self>,
+            gain: &Tensor<Self>,
+            eps: f64,
+            bm: usize,
+            bd: usize,
+        ) -> Result<(), KernelError>;
     }
 }
 
@@ -95,6 +119,17 @@ impl sealed::Sealed for bf16 {
     ) -> Result<(), KernelError> {
         softmax::launch_f32(y, x, bm, bn)
     }
+
+    fn launch_rmsnorm(
+        y: &mut Tensor<f32>,
+        x: &Tensor<Self>,
+        gain: &Tensor<Self>,
+        eps: f64,
+        bm: usize,
+        bd: usize,
+    ) -> Result<(), KernelError> {
+        rmsnorm::launch_f32(y, x, gain, eps, bm, bd)
+    }
 }
 
 impl sealed::Sealed for f32 {
@@ -108,6 +143,17 @@ impl sealed::Sealed for f32 {
     ) -> Result<(), KernelError> {
         softmax::launch_f32(y, x, bm, bn)
     }
+
+    fn launch_rmsnorm(
+        y: &mut Tensor<f32>,
+        x: &Tensor<Self>,
+        gain: &Tensor<Self>,
+        eps: f64,
+        bm: usize,
+        bd: usize,
+    ) -> Result<(), KernelError> {
+        rmsnorm::launch_f32(y, x, gain, eps, bm, bd)
+    }
 }
 
 impl sealed::Sealed for f64 {
@@ -120,6 +166,17 @@ impl sealed::Sealed for f64 {
         bn: usize,
     ) -> Result<(), KernelError> {
         softmax::launch_f64(y, x, bm, bn)
+    }
+
+    fn launch_rmsnorm(
+        y: &mut Tensor<f64>,
+        x: &Tensor<Self>,
+        gain: &Tensor<Self>,
+        eps: f64,
+        bm: usize,
+        bd: usize,
+    ) -> Result<(), KernelError> {
+        rmsnorm::launch_f64(y, x, gain, eps, bm, bd)
     }
 }
 

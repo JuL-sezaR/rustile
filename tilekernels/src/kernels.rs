@@ -52,4 +52,51 @@ pub(crate) mod entries {
         let den: Tile<f64, { [BM, BN] }> = den.reshape(shape![BM, 1]).broadcast(shape![BM, BN]);
         y.store(num / den);
     }
+
+    /// RMSNorm along the columns. The tile spans the whole row. Columns past
+    /// the end read as 0, so they add nothing to the sum of squares, and the
+    /// mean divides by the real column count. `g` is loaded as one tile,
+    /// zero-padded the same way.
+    #[cutile::entry()]
+    fn rmsnorm_f32<E: ElementType, const BM: i32, const BD: i32>(
+        y: &mut Tensor<f32, { [BM, BD] }>,
+        x: &Tensor<E, { [-1, -1] }>,
+        g: &Tensor<E, { [-1] }>,
+        eps: f32,
+    ) {
+        let tx: Tile<E, { [BM, BD] }> = x.load_like(y);
+        let tx: Tile<f32, { [BM, BD] }> = convert_tile(tx);
+        let d: i32 = x.shape()[1];
+        let df: f32 = convert_scalar(d);
+        let ss: Tile<f32, { [BM] }> = reduce_sum(tx * tx, 1i32);
+        let ss: Tile<f32, { [BM, BD] }> = ss.reshape(shape![BM, 1]).broadcast(y.shape());
+        let dt: Tile<f32, { [BM, BD] }> = df.broadcast(y.shape());
+        let et: Tile<f32, { [BM, BD] }> = eps.broadcast(y.shape());
+        let inv: Tile<f32, { [BM, BD] }> = rsqrt(ss / dt + et, ftz::Disabled);
+        let tg: Tile<E, { [BD] }> = g.partition(shape![BD]).load([0i32]);
+        let tg: Tile<f32, { [BD] }> = convert_tile(tg);
+        let tg: Tile<f32, { [BM, BD] }> = tg.reshape(shape![1, BD]).broadcast(y.shape());
+        y.store(tx * inv * tg);
+    }
+
+    /// The same in `f64`.
+    #[cutile::entry()]
+    fn rmsnorm_f64<const BM: i32, const BD: i32>(
+        y: &mut Tensor<f64, { [BM, BD] }>,
+        x: &Tensor<f64, { [-1, -1] }>,
+        g: &Tensor<f64, { [-1] }>,
+        eps: f64,
+    ) {
+        let tx: Tile<f64, { [BM, BD] }> = x.load_like(y);
+        let d: i32 = x.shape()[1];
+        let df: f64 = convert_scalar(d);
+        let ss: Tile<f64, { [BM] }> = reduce_sum(tx * tx, 1i32);
+        let ss: Tile<f64, { [BM, BD] }> = ss.reshape(shape![BM, 1]).broadcast(y.shape());
+        let dt: Tile<f64, { [BM, BD] }> = df.broadcast(y.shape());
+        let et: Tile<f64, { [BM, BD] }> = eps.broadcast(y.shape());
+        let inv: Tile<f64, { [BM, BD] }> = rsqrt(ss / dt + et, ftz::Disabled);
+        let tg: Tile<f64, { [BD] }> = g.partition(shape![BD]).load([0i32]);
+        let tg: Tile<f64, { [BM, BD] }> = tg.reshape(shape![1, BD]).broadcast(y.shape());
+        y.store(tx * inv * tg);
+    }
 }
