@@ -75,11 +75,20 @@ pub fn from_f32s<T: Num>(v: &[f32]) -> Vec<T> {
     v.iter().map(|&x| T::from_f32(x)).collect()
 }
 
-/// The largest absolute difference.
+/// The largest value, or NaN if any is NaN. `f64::max` alone would skip a
+/// NaN, and a kernel that returned NaN would pass every tolerance check.
+pub fn worst(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(0.0, |m, v| {
+        if m.is_nan() || v.is_nan() {
+            f64::NAN
+        } else {
+            m.max(v)
+        }
+    })
+}
+
+/// The largest absolute difference; NaN if either side holds a NaN.
 pub fn max_abs_err(got: &[f64], want: &[f64]) -> f64 {
     assert_eq!(got.len(), want.len());
-    got.iter()
-        .zip(want)
-        .map(|(g, w)| (g - w).abs())
-        .fold(0.0, f64::max)
+    worst(got.iter().zip(want).map(|(g, w)| (g - w).abs()))
 }
