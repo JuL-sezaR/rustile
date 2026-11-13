@@ -1,23 +1,27 @@
 //! Tile kernels on cuTile Rust, and the CPU code they are tested against.
 //!
-//! The design is in `docs/design/kernels.md`. The kernels are added one at a
-//! time; so far there are [`softmax`], [`rmsnorm`] and [`gather`]. The tile-shape rules are in [`tiles`]
-//! and the CPU references the kernels are tested against in [`reference`](mod@reference).
+//! The design is in `docs/design/kernels.md`. The kernels are [`softmax`],
+//! [`rmsnorm`], [`gather`] and [`linear`]. The tile-shape rules are in
+//! [`tiles`] and the CPU references the kernels are tested against in
+//! [`reference`](mod@reference).
 
 mod gather;
 mod kernels;
+mod linear;
 pub mod reference;
 mod rmsnorm;
 mod softmax;
 pub mod tiles;
 
 pub use gather::{gather, gather_into, gather_into_with_tiles};
+pub use linear::{linear, linear_into};
 pub use rmsnorm::{rmsnorm, rmsnorm_into};
 pub use softmax::{softmax, softmax_into};
 
 use cutile::half::bf16;
 use cutile::prelude::{DeviceError, Tensor};
 use std::fmt;
+use tiles::LinearTiles;
 
 #[derive(Debug)]
 pub enum KernelError {
@@ -100,6 +104,17 @@ mod sealed {
             bm: usize,
             bd: usize,
         ) -> Result<(), KernelError>;
+
+        /// Launches the linear entry, with no checks: `x` is `[m, k]`, `w` is
+        /// `[n, k]`, `bias` is `[n]`, `y` is `[m, n]`, and the tile sizes are
+        /// powers of two.
+        fn launch_linear(
+            y: &mut Tensor<Self::Out>,
+            x: &Tensor<Self>,
+            w: &Tensor<Self>,
+            bias: &Tensor<Self::Out>,
+            tiles: crate::tiles::LinearTiles,
+        ) -> Result<(), KernelError>;
     }
 }
 
@@ -132,6 +147,16 @@ impl sealed::Sealed for bf16 {
     ) -> Result<(), KernelError> {
         rmsnorm::launch_f32(y, x, gain, eps, bm, bd)
     }
+
+    fn launch_linear(
+        y: &mut Tensor<f32>,
+        x: &Tensor<Self>,
+        w: &Tensor<Self>,
+        bias: &Tensor<f32>,
+        tiles: LinearTiles,
+    ) -> Result<(), KernelError> {
+        linear::launch_f32(y, x, w, bias, tiles)
+    }
 }
 
 impl sealed::Sealed for f32 {
@@ -156,6 +181,16 @@ impl sealed::Sealed for f32 {
     ) -> Result<(), KernelError> {
         rmsnorm::launch_f32(y, x, gain, eps, bm, bd)
     }
+
+    fn launch_linear(
+        y: &mut Tensor<f32>,
+        x: &Tensor<Self>,
+        w: &Tensor<Self>,
+        bias: &Tensor<f32>,
+        tiles: LinearTiles,
+    ) -> Result<(), KernelError> {
+        linear::launch_f32(y, x, w, bias, tiles)
+    }
 }
 
 impl sealed::Sealed for f64 {
@@ -179,6 +214,16 @@ impl sealed::Sealed for f64 {
         bd: usize,
     ) -> Result<(), KernelError> {
         rmsnorm::launch_f64(y, x, gain, eps, bm, bd)
+    }
+
+    fn launch_linear(
+        y: &mut Tensor<f64>,
+        x: &Tensor<Self>,
+        w: &Tensor<Self>,
+        bias: &Tensor<f64>,
+        tiles: LinearTiles,
+    ) -> Result<(), KernelError> {
+        linear::launch_f64(y, x, w, bias, tiles)
     }
 }
 
