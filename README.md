@@ -22,7 +22,7 @@ the design for the tile kernels and the manager changes they need is in
 | Crate | What it is |
 |---|---|
 | [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
-| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax, RMSNorm and embedding gather so far. |
+| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax, RMSNorm, embedding gather and a linear layer. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
@@ -399,7 +399,8 @@ write-back).
 `tilekernels` holds kernels written in cuTile Rust, each tested against a
 single-threaded CPU loop in `f64` (`tilekernels/src/reference.rs`). The
 design, and the order they are built in, is in
-[docs/design/kernels.md](docs/design/kernels.md). So far: softmax, RMSNorm and embedding gather.
+[docs/design/kernels.md](docs/design/kernels.md). The four kernels it was designed with are there: softmax, RMSNorm,
+embedding gather and a linear layer.
 
 ### Softmax
 
@@ -527,6 +528,58 @@ What this shows:
 - **The first call is the compile**: 0.16 s, the same in every process, a
   little less than softmax and RMSNorm with their 4096-element tiles.
 
+### Linear
+
+`tilekernels::linear(&x, &w, bias)` computes `x @ wᵀ + bias` for `x` of
+`[m, k]` and `w` of `[n, k]`, one row per output as weight files store it,
+so no transposed copy is made. BF16 and F32 input give F32 output, F64 gives
+F64. Each block computes a `bm × bn` output tile with tensor-core `mma`,
+stepping `bk` along `k`. The tests hold each element to within
+`16 × unit roundoff × Σ|terms|` of the reference; the worst F32 element
+reached 16% of that, BF16 9%, and F64 was exact.
+
+```sh
+cargo run --release -p tilekernels --example kernelbench -- linear
+cargo run --release -p tilekernels --example kernelbench -- linear --first-call
+```
+
+RTX 5080 Laptop, WSL2, 2026-11-14, with a bias, measured as for softmax.
+The CPU reference was timed once per shape and is shared by the tiles of the
+sweep. TFLOP/s counts `2 m k n` operations against the latency per call, so
+it understates what the kernel alone does.
+
+| Case | Tile | First call | Latency per call | TFLOP/s | CPU reference |
+|---|---|---|---|---|---|
+| F32, 256 × 1024 × 4096 | 64 × 64 × 32 (default) | 0.33 s (0.33 to 0.34) | 1.216 ms (1.180 to 1.232) | 1.8 | 937 ms (926 to 971) |
+| F32, same | 16 × 16 × 16 | 0.19 s (0.19 to 0.19) | 2.497 ms (2.452 to 2.512) | 0.9 | (same) |
+| F32, same | 32 × 32 × 32 | 0.24 s (0.23 to 0.24) | 1.257 ms (1.222 to 1.279) | 1.7 | (same) |
+| F32, same | 64 × 64 × 64 | 0.65 s (0.64 to 0.65) | 2.312 ms (1.811 to 2.349) | 0.9 | (same) |
+| BF16 in, 256 × 1024 × 4096 | 64 × 64 × 32 (default) | 0.25 s (0.25 to 0.27) | 0.082 ms (0.075 to 0.087) | 26 | 923 ms (915 to 931) |
+| F32, 100 × 1000 × 3000 | 64 × 64 × 32 (default) | 0.33 s (0.32 to 0.34) | 0.548 ms (0.519 to 0.552) | 1.1 | 206 ms (193 to 212) |
+| F32, 1 × 1024 × 4096 | 16 × 64 × 32 (default) | 0.24 s (0.24 to 0.24) | 0.150 ms (0.144 to 0.167) | 0.06 | 3.7 ms (3.4 to 3.9) |
+
+What this shows:
+
+- **The default tile stays.** 32 × 32 × 32 is 3% slower than 64 × 64 × 32,
+  which is no difference. 16 × 16 × 16 and 64 × 64 × 64 take about twice as
+  long, outside any variance seen so far.
+- **BF16 input is about 15 times faster than F32** on the same shape
+  (0.082 against 1.216 ms), far more than the noise between cases (issue
+  #12). The F32 results are accurate to F32 rounding, well inside a
+  tolerance that single-pass TF32 would fail by a factor of hundreds, so the
+  F32 kernel is not taking BF16's fast path. Which instructions each one
+  compiles to was not checked. BF16's 0.082 ms is close to the per-call cost
+  seen for the other kernels, so its kernel time may be smaller still.
+- **One input row is mostly overhead.** `m = 1` pads to a 16-row tile, and
+  0.150 ms moves 16 MiB of F32 weight for 8 million operations.
+- **The first call grows with the tile**: from 0.19 s at 16³ to 0.65 s at
+  64 × 64 × 64, steady from process to process.
+- **Against the CPU loop**, F32 is about 770 times faster and BF16 about
+  11,000 times. The CPU loop is a naive single-threaded baseline in `f64`
+  that also sums the magnitudes of the terms for the test tolerance, about
+  twice the work a plain product needs, so these ratios are not a speed
+  claim.
+
 ## Limitations
 
 - The budget is the manager's own accounting, not the driver's free-memory
@@ -567,6 +620,10 @@ What this shows:
   across blocks. The first call's compile time grows with the row width
   (0.20 s for a 4096-element tile, 0.80 s for 32,768).
 - The kernels write F32 for BF16 input; there is no BF16 output.
+- The F32 linear layer reaches 1.8 TFLOP/s against about 26 for BF16 input
+  on the same shape.
+- The linear layer pads a short input to a 16-row tile, so `m = 1` uses a
+  sixteenth of each block's work.
 - Gather takes `i32` ids only: cutile 0.4 cannot narrow `i64` to `i32` in a
   kernel. An id outside the table gives a row of zeros, not an error.
 - Gather needs the whole table on the device; the manager moves whole
