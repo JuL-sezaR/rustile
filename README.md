@@ -416,33 +416,41 @@ cargo run --release -p tilekernels --example kernelbench -- softmax --first-call
 ```
 
 The first command measures latency per call. RTX 5080 Laptop, WSL2,
-2026-11-13. Latency and CPU are medians of 5 measurements after a warmup
+2026-11-14. Latency and CPU are medians of 5 measurements after a warmup
 call, with min to max in brackets. A measurement is the average of 20 calls.
 Latency is end to end for one `softmax_into` call: the argument checks, the
 kernel cache lookup, the launch, and waiting for the stream. It is not the
-kernel's own time.
+kernel's own time. The second command measures the first call of each case,
+which includes compiling the kernel, in 5 separate processes (median, min to
+max). A kernel for another case is compiled first in each process, so
+cutile's one-time check of the toolchain is not counted.
 
-| Case | Tile | Latency per call | CPU reference |
-|---|---|---|---|
-| F32, 4096 × 1024 | 4 × 1024 | 0.086 ms (0.084 to 0.095) | 19.3 ms (19.0 to 20.3) |
-| F32, 16 × 32768 | 1 × 32768 | 0.077 ms (0.074 to 0.078) | 1.5 ms (1.5 to 1.7) |
-| BF16 in, 4096 × 1024 | 4 × 1024 | 0.084 ms (0.082 to 0.087) | 20.4 ms (19.8 to 21.5) |
+| Case | Tile | First call | Latency per call | CPU reference |
+|---|---|---|---|---|
+| F32, 4096 × 1024 | 4 × 1024 | 0.22 s (0.22 to 0.22) | 0.106 ms (0.105 to 0.112) | 22.0 ms (21.7 to 22.4) |
+| F32, 16 × 32768 | 1 × 32768 | 0.80 s (0.79 to 0.82) | 0.069 ms (0.066 to 0.075) | 1.8 ms (1.7 to 2.1) |
+| BF16 in, 4096 × 1024 | 4 × 1024 | 0.20 s (0.20 to 0.20) | 0.081 ms (0.078 to 0.089) | 21.8 ms (21.5 to 22.0) |
 
 What this shows:
 
-- **The latency does not follow the size.** 16 × 32768 has an eighth of the
-  elements of 4096 × 1024 and takes 0.077 ms against 0.086 ms, a difference
-  inside the variance. So most of the 0.08 ms is what any call costs, not
-  the kernel's work, and this column cannot say how fast the kernel itself
-  is.
-- **BF16 input costs the same as F32** (0.084 against 0.086 ms).
-- **Against the CPU loop**, a call is about 220 times faster at
-  4096 × 1024 and 19 times at 16 × 32768. The CPU loop is a naive
+- **The latency barely follows the size.** 16 × 32768 has an eighth of the
+  elements of 4096 × 1024 and takes 0.069 ms against 0.106 ms, a third
+  less, not an eighth. So most of the 0.07 to 0.1 ms is what any call costs,
+  not the kernel's work, and this column cannot say how fast the kernel
+  itself is.
+- **BF16 against F32 is not settled.** In this run BF16 input is 24% lower
+  (0.081 against 0.106 ms), which is outside the run-to-run variance and fits
+  it reading half the bytes. A run on 2026-11-13 gave 0.084 and 0.086 ms,
+  no difference, and the F32 figure itself moved from 0.086 to 0.106 ms
+  between the two runs. So differences smaller than about 25% between cases
+  are not claimed.
+- **Against the CPU loop**, a call is about 200 times faster at
+  4096 × 1024 and about 26 times at 16 × 32768. The CPU loop is a naive
   single-threaded baseline in `f64`, not an optimized library, so the ratios
   show the kernel is worth having, not how fast softmax can be.
-
-The first-call (compile) times of these cases are being re-measured over
-separate processes (`--first-call`) and will be added here.
+- **The first call is the compile**: 0.20 to 0.22 s for a 4096-element tile
+  and 0.80 s for a 32,768-element one, steady from process to process (the
+  ranges are 0.01 to 0.03 s wide).
 
 ## Limitations
 
@@ -481,7 +489,8 @@ separate processes (`--first-call`) and will be added here.
   `ensure_resident` of that tensor, which leaves it spilled.
 - Softmax needs a row to fit in one tile (at most 16,777,216 columns): in
   cutile 0.4 a block can only store its own tile, so a row cannot be reduced
-  across blocks. The first call's compile time grows with the row width.
+  across blocks. The first call's compile time grows with the row width
+  (0.20 s for a 4096-element tile, 0.80 s for 32,768).
 - The kernels write F32 for BF16 input; there is no BF16 output.
 - The kernels do not run on tensors the manager holds yet.
 
