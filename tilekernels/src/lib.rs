@@ -1,8 +1,8 @@
 //! Tile kernels on cuTile Rust, and the CPU code they are tested against.
 //!
-//! The design is in `docs/design/kernels.md`. So far this crate holds the
-//! parts that need no GPU: the tile-shape rules ([`tiles`]) and the CPU
-//! references ([`reference`]). The kernels are added one at a time.
+//! The design is in `docs/design/kernels.md`. The kernels are added one at a
+//! time; so far there is [`softmax`]. The tile-shape rules are in [`tiles`]
+//! and the CPU references the kernels are tested against in [`reference`].
 
 mod kernels;
 pub mod reference;
