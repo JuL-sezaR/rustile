@@ -22,7 +22,7 @@ the design for the tile kernels and the manager changes they need is in
 | Crate | What it is |
 |---|---|
 | [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
-| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax so far. |
+| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax and RMSNorm so far. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
@@ -399,7 +399,7 @@ write-back).
 `tilekernels` holds kernels written in cuTile Rust, each tested against a
 single-threaded CPU loop in `f64` (`tilekernels/src/reference.rs`). The
 design, and the order they are built in, is in
-[docs/design/kernels.md](docs/design/kernels.md). So far: softmax.
+[docs/design/kernels.md](docs/design/kernels.md). So far: softmax and RMSNorm.
 
 ### Softmax
 
@@ -452,6 +452,42 @@ What this shows:
   and 0.80 s for a 32,768-element one, steady from process to process (the
   ranges are 0.01 to 0.03 s wide).
 
+### RMSNorm
+
+`tilekernels::rmsnorm(&x, &gain, eps)` computes
+`x / sqrt(mean(x²) + eps) * gain` along each row of a `[rows, d]` tensor,
+with `gain` of length `d`. Element types and tiles are as for softmax. The
+tests hold every element to within `1e-6 + 1e-5 × |reference|` for F32
+output and `1e-12 + 1e-12 × |reference|` for F64; the worst element in any
+test reached 1.6% of its limit.
+
+```sh
+cargo run --release -p tilekernels --example kernelbench -- rmsnorm
+cargo run --release -p tilekernels --example kernelbench -- rmsnorm --first-call
+```
+
+RTX 5080 Laptop, WSL2, 2026-11-14, `eps = 1e-6`, measured as for softmax.
+
+| Case | Tile | First call | Latency per call | CPU reference |
+|---|---|---|---|---|
+| F32, 4096 × 1024 | 4 × 1024 | 0.21 s (0.21 to 0.22) | 0.098 ms (0.083 to 0.103) | 12.6 ms (11.9 to 14.2) |
+| BF16 in, 4096 × 1024 | 4 × 1024 | 0.19 s (0.19 to 0.19) | 0.057 ms (0.046 to 0.069) | 12.7 ms (12.6 to 12.9) |
+| F32, 4096 × 1000 | 4 × 1024 | 0.21 s (0.21 to 0.21) | 0.064 ms (0.058 to 0.066) | 6.2 ms (4.7 to 9.5) |
+
+What this shows:
+
+- **The cases cannot be compared with each other.** F32 4096 × 1000 runs
+  the same tile as F32 4096 × 1024 on 2% fewer elements, yet its latency is
+  35% lower, and its CPU reference took half the time on the same 2% less
+  work. That is the machine changing between cases, not the code. So the
+  BF16 case being 42% lower than F32 4096 × 1024 is not claimed either; the
+  softmax runs above disagreed with each other about BF16 too.
+- **Against the CPU loop**, a call is about 100 to 220 times faster. As for
+  softmax, the CPU loop is a naive single-threaded baseline in `f64`, so
+  this shows the kernel is worth having, not how fast RMSNorm can be.
+- **The first call is the compile**: 0.19 to 0.21 s, steady from process to
+  process, about what the softmax kernels with a 4096-element tile take.
+
 ## Limitations
 
 - The budget is the manager's own accounting, not the driver's free-memory
@@ -487,11 +523,15 @@ What this shows:
   cheaper (about 0.3 ms per MiB either way).
 - A failed prefetch on the copy stream is reported by the next
   `ensure_resident` of that tensor, which leaves it spilled.
-- Softmax needs a row to fit in one tile (at most 16,777,216 columns): in
+- Softmax and RMSNorm need a row to fit in one tile (at most 16,777,216 columns): in
   cutile 0.4 a block can only store its own tile, so a row cannot be reduced
   across blocks. The first call's compile time grows with the row width
   (0.20 s for a 4096-element tile, 0.80 s for 32,768).
 - The kernels write F32 for BF16 input; there is no BF16 output.
+- `kernelbench` cases are not comparable with each other to better than
+  about 35%: one case of the RMSNorm run was 35% faster than another doing
+  the same work, on the GPU and on the CPU alike. Only a case's own spread
+  (min to max) is narrow.
 - The kernels do not run on tensors the manager holds yet.
 
 ## Building
