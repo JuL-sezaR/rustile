@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Num, dev, from_f32s, host, max_abs_err, rnd, to_f64s};
+use common::{Num, dev, from_f32s, host, max_abs_err, rnd, to_f64s, worst};
 use cutile::api;
 use cutile::half::bf16;
 use cutile::prelude::*;
@@ -31,10 +31,10 @@ where
     let want = reference::softmax(&to_f64s(xs), rows, cols);
     let (tol, sum_tol) = tolerance::<E>();
     let err = max_abs_err(&got, &want);
-    let sum_err = got
-        .chunks(cols)
-        .map(|row| (row.iter().sum::<f64>() - 1.0).abs())
-        .fold(0.0, f64::max);
+    let sum_err = worst(
+        got.chunks(cols)
+            .map(|row| (row.iter().sum::<f64>() - 1.0).abs()),
+    );
     println!("{label} {rows}x{cols}: max error {err:e}, worst row sum error {sum_err:e}");
     assert!(err <= tol, "{label} {rows}x{cols}: error {err:e} > {tol:e}");
     assert!(
@@ -42,6 +42,14 @@ where
         "{label} {rows}x{cols}: row sum error {sum_err:e} > {sum_tol:e}"
     );
     got
+}
+
+#[test]
+fn the_error_helpers_do_not_hide_a_nan() {
+    assert!(max_abs_err(&[1.0, f64::NAN], &[1.0, 1.0]).is_nan());
+    assert!(max_abs_err(&[f64::NAN, 1.0], &[1.0, 1.0]).is_nan());
+    assert!(worst([0.5, f64::NAN, 0.1].into_iter()).is_nan());
+    assert_eq!(max_abs_err(&[1.0, 3.0], &[1.5, 1.0]), 2.0);
 }
 
 fn random<E: Num>(rows: usize, cols: usize, seed: u64) -> Vec<E> {
@@ -125,7 +133,25 @@ fn softmax_into_overwrites_the_output() {
     softmax_into(&mut y, &x).unwrap();
     let got = to_f64s(&host(&y));
     let want = reference::softmax(&to_f64s(&xs), 3, 100);
-    assert!(max_abs_err(&got, &want) <= 1e-6);
+    let err = max_abs_err(&got, &want);
+    println!("softmax_into 3x100 over a filled output: max error {err:e}");
+    assert!(err <= 1e-6, "error {err:e} > 1e-6");
+}
+
+/// cutile 0.4 cannot allocate a tensor with no elements (`Tensor::uninitialized`
+/// asserts `len > 0`), so these are `api::meta` tensors: a shape and no device
+/// memory. The shape is rejected before anything touches the device.
+#[test]
+fn a_tensor_with_no_rows_or_no_columns_is_a_shape_error() {
+    for shape in [[0usize, 4], [4, 0], [0, 0]] {
+        let x = api::meta::<f32>(&shape).sync().unwrap();
+        expect_shape_error(softmax(&x), &format!("softmax of {shape:?}"));
+        let mut y = api::meta::<f32>(&shape).sync().unwrap();
+        expect_shape_error(
+            softmax_into(&mut y, &x),
+            &format!("softmax_into of {shape:?}"),
+        );
+    }
 }
 
 /// The first call took about 20 s in the design probe, so this is run by hand:

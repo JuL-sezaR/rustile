@@ -1,30 +1,73 @@
 //! Benchmark of the tile kernels against a single-threaded CPU loop.
 //!
 //! ```sh
-//! cargo run --release -p tilekernels --example kernelbench -- softmax [--runs N] [--reps R]
+//! # latency per call against the CPU loop
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather|linear> [--runs N] [--reps R]
+//! # the first call of each case (the JIT compile), over separate processes
+//! cargo run --release -p tilekernels --example kernelbench -- <softmax|rmsnorm|gather|linear> --first-call [--processes N]
 //! ```
 //!
-//! For each case: the first call is timed on its own (it includes the JIT
-//! compile) and is the warmup. Then `--runs` measurements are taken, each
-//! the wall time of `--reps` consecutive calls divided by `--reps`. Every
-//! call waits for its kernel. The CPU reference gets one unreported warmup
-//! call and `--runs` timed calls. Medians are reported with min and max;
-//! nothing else is excluded.
+//! Before anything is timed, a throwaway kernel is compiled and launched, so
+//! that cutile's one-time check of the toolchain is not part of any case.
+//!
+//! **Latency.** For each case the first call is the warmup and is not
+//! reported. Then `--runs` measurements are taken, each the wall time of
+//! `--reps` consecutive calls divided by `--reps`. A call is the whole of
+//! `softmax_into`: argument checks, kernel cache lookup, launch, and waiting
+//! for the stream. It is not the kernel's own time. The CPU reference gets one
+//! unreported warmup call and `--runs` timed calls. Medians are reported with
+//! min and max; nothing else is excluded.
+//!
+//! **First call.** A compile happens once per process, so it cannot be
+//! repeated inside one. `--first-call` starts `--processes` copies of this
+//! program, each of which times only the first call of every case, and
+//! reports the median, min and max over the processes.
 
 use cutile::DTypeId;
 use cutile::api;
 use cutile::half::bf16;
 use cutile::prelude::*;
 use std::hint::black_box;
+use std::process::{Command, Stdio};
 use std::time::Instant;
-use tilekernels::{Float, KernelError, reference, softmax_into, tiles};
+use tilekernels::tiles::LinearTiles;
+use tilekernels::{
+    Float, KernelError, gather_into, linear_into, reference, rmsnorm_into, softmax_into, tiles,
+};
 
 const DEFAULT_RUNS: usize = 5;
 const DEFAULT_REPS: usize = 20;
+const DEFAULT_PROCESSES: usize = 5;
+
+type BoxError = Box<dyn std::error::Error>;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Kernel {
     Softmax,
+    Rmsnorm,
+    Gather,
+    Linear,
+}
+
+impl Kernel {
+    fn name(self) -> &'static str {
+        match self {
+            Kernel::Softmax => "softmax",
+            Kernel::Rmsnorm => "rmsnorm",
+            Kernel::Gather => "gather",
+            Kernel::Linear => "linear",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    /// Latency per call against the CPU loop.
+    Bench,
+    /// Start `processes` children and report their first calls.
+    FirstCall { processes: usize },
+    /// Time only the first call of each case and print it for the parent.
+    FirstCallChild,
 }
 
 #[derive(Debug, PartialEq)]
@@ -32,12 +75,16 @@ struct Args {
     kernel: Kernel,
     runs: usize,
     reps: usize,
+    mode: Mode,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut kernel = None;
     let mut runs = DEFAULT_RUNS;
     let mut reps = DEFAULT_REPS;
+    let mut processes = None;
+    let mut first_call = false;
+    let mut child = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut number = |flag: &str| -> Result<usize, String> {
@@ -50,14 +97,41 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         match arg.as_str() {
             "--runs" => runs = number("--runs")?,
             "--reps" => reps = number("--reps")?,
+            "--processes" => processes = Some(number("--processes")?),
+            "--first-call" => first_call = true,
+            "--first-call-child" => child = true,
             "softmax" => kernel = Some(Kernel::Softmax),
+            "rmsnorm" => kernel = Some(Kernel::Rmsnorm),
+            "gather" => kernel = Some(Kernel::Gather),
+            "linear" => kernel = Some(Kernel::Linear),
             other if other.starts_with("--") => return Err(format!("unknown option {other}")),
-            other => return Err(format!("unknown kernel {other}; available: softmax")),
+            other => {
+                return Err(format!(
+                    "unknown kernel {other}; available: softmax, rmsnorm, gather, linear"
+                ));
+            }
         }
     }
-    let kernel =
-        kernel.ok_or("usage: kernelbench <kernel> [--runs N] [--reps R]; kernels: softmax")?;
-    Ok(Args { kernel, runs, reps })
+    let kernel = kernel.ok_or(
+        "usage: kernelbench <kernel> [--runs N] [--reps R] [--first-call [--processes N]]; kernels: softmax, rmsnorm, gather, linear",
+    )?;
+    let mode = match (first_call, child, processes) {
+        (true, true, _) => {
+            return Err("--first-call and --first-call-child exclude each other".into());
+        }
+        (false, true, _) => Mode::FirstCallChild,
+        (true, false, n) => Mode::FirstCall {
+            processes: n.unwrap_or(DEFAULT_PROCESSES),
+        },
+        (false, false, None) => Mode::Bench,
+        (false, false, Some(_)) => return Err("--processes needs --first-call".into()),
+    };
+    Ok(Args {
+        kernel,
+        runs,
+        reps,
+        mode,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -116,16 +190,49 @@ fn time_cpu<R>(runs: usize, mut call: impl FnMut() -> R) -> Stats {
     Stats::of(&samples)
 }
 
-fn format_line(label: &str, tiles: &str, first: f64, gpu: Stats, cpu: Stats) -> String {
+fn format_line(label: &str, tiles: &str, gpu: Stats, cpu: Stats) -> String {
     let ms = |s: f64| s * 1e3;
     format!(
-        "{label} tiles {tiles}: first {first:.2} s | gpu {:.3} ms (min {:.3}, max {:.3}) | cpu {:.1} ms (min {:.1}, max {:.1})",
+        "{label} tiles {tiles}: latency {:.3} ms/call (min {:.3}, max {:.3}) | cpu {:.1} ms (min {:.1}, max {:.1})",
         ms(gpu.median),
         ms(gpu.min),
         ms(gpu.max),
         ms(cpu.median),
         ms(cpu.min),
         ms(cpu.max),
+    )
+}
+
+/// What a child prints for the parent: one line per case.
+fn child_line(label: &str, tiles: &str, first: f64) -> String {
+    format!("FIRST|{label}|{tiles}|{first}")
+}
+
+/// The cases of one child's output, in order: (label, tiles, seconds).
+fn parse_child_output(output: &str) -> Result<Vec<(String, String, f64)>, String> {
+    let mut cases = Vec::new();
+    for line in output.lines().filter(|l| l.starts_with("FIRST|")) {
+        let parts: Vec<&str> = line.split('|').collect();
+        let [_, label, tiles, seconds] = parts[..] else {
+            return Err(format!("cannot read the child's line {line:?}"));
+        };
+        let seconds = seconds
+            .parse::<f64>()
+            .map_err(|_| format!("cannot read the time in the child's line {line:?}"))?;
+        cases.push((label.to_string(), tiles.to_string(), seconds));
+    }
+    Ok(cases)
+}
+
+/// The first-call line of one case, from its times in each process.
+fn format_first_line(label: &str, tiles: &str, seconds: &[f64]) -> String {
+    let s = Stats::of(seconds);
+    format!(
+        "{label} tiles {tiles}: first call {:.2} s (min {:.2}, max {:.2}) over {} processes",
+        s.median,
+        s.min,
+        s.max,
+        seconds.len()
     )
 }
 
@@ -183,7 +290,56 @@ fn softmax_tolerance<E: Float>() -> (f64, f64) {
     }
 }
 
-/// One softmax case. Returns whether the last GPU result matched the reference.
+/// The largest value, or NaN if any is NaN (`f64::max` would skip it).
+fn worst(values: impl Iterator<Item = f64>) -> f64 {
+    values.fold(0.0, |m, v| {
+        if m.is_nan() || v.is_nan() {
+            f64::NAN
+        } else {
+            m.max(v)
+        }
+    })
+}
+
+/// Compares a softmax result with the reference. The error is the text that
+/// follows `MISMATCH <case>:`.
+fn check_softmax(
+    got: &[f64],
+    want: &[f64],
+    cols: usize,
+    tol: f64,
+    sum_tol: f64,
+) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("got {} values, want {}", got.len(), want.len()));
+    }
+    let err = worst(got.iter().zip(want).map(|(g, w)| (g - w).abs()));
+    let sum_err = worst(
+        got.chunks(cols)
+            .map(|row| (row.iter().sum::<f64>() - 1.0).abs()),
+    );
+    // Written so that NaN fails.
+    if err <= tol && sum_err <= sum_tol {
+        Ok(())
+    } else {
+        Err(format!(
+            "max error {err:e} (limit {tol:e}), row sum error {sum_err:e} (limit {sum_tol:e})"
+        ))
+    }
+}
+
+/// cutile checks the toolchain once per process, when it compiles its first
+/// kernel. Compile and launch one that no case uses (F32, a 1 x 1 tile), so
+/// that check is not part of any case's first call.
+fn warm_toolchain() -> Result<(), KernelError> {
+    let x = api::ones::<f32>(&[1, 1]).sync()?;
+    let mut y = api::zeros::<f32>(&[1, 1]).sync()?;
+    softmax_into(&mut y, &x)
+}
+
+/// One softmax case. In a first-call child it prints the first call's time
+/// and stops. Otherwise it returns whether the last GPU result matched the
+/// reference.
 fn softmax_case<E>(name: &str, rows: usize, cols: usize, args: &Args) -> Result<bool, KernelError>
 where
     E: Float + Num,
@@ -202,6 +358,12 @@ where
     let start = Instant::now();
     softmax_into(&mut y, &x)?;
     let first = start.elapsed().as_secs_f64();
+    let label = format!("softmax {name} {rows}x{cols}");
+    let tile = format!("{bm}x{bn}");
+    if args.mode == Mode::FirstCallChild {
+        println!("{}", child_line(&label, &tile, first));
+        return Ok(true);
+    }
     let gpu = time_gpu(args.runs, args.reps, || softmax_into(&mut y, &x))?;
 
     let xs64: Vec<f64> = xs.iter().map(|&v| v.to_f64()).collect();
@@ -216,40 +378,383 @@ where
         .collect();
     let want = reference::softmax(&xs64, rows, cols);
     let (tol, sum_tol) = softmax_tolerance::<E>();
-    let err = got
-        .iter()
-        .zip(&want)
-        .map(|(g, w)| (g - w).abs())
-        .fold(0.0, f64::max);
-    let sum_err = got
-        .chunks(cols)
-        .map(|row| (row.iter().sum::<f64>() - 1.0).abs())
-        .fold(0.0, f64::max);
+    let verdict = check_softmax(&got, &want, cols, tol, sum_tol);
 
-    let label = format!("softmax {name} {rows}x{cols}");
-    println!(
-        "{}",
-        format_line(&label, &format!("{bm}x{bn}"), first, gpu, cpu)
+    println!("{}", format_line(&label, &tile, gpu, cpu));
+    if let Err(message) = &verdict {
+        eprintln!("MISMATCH {label}: {message}");
+    }
+    Ok(verdict.is_ok())
+}
+
+/// The RMSNorm test tolerance for this output type: `abs + rel * |want|`.
+fn rmsnorm_tolerance<E: Float>() -> (f64, f64) {
+    if <E::Out as DType>::DTYPE == DTypeId::F64 {
+        (1e-12, 1e-12)
+    } else {
+        (1e-6, 1e-5)
+    }
+}
+
+/// Compares a result with the reference, element by element, within
+/// `abs + rel * |want|`. The error is the text that follows
+/// `MISMATCH <case>:`.
+fn check_close(got: &[f64], want: &[f64], abs: f64, rel: f64) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("got {} values, want {}", got.len(), want.len()));
+    }
+    let err = worst(got.iter().zip(want).map(|(g, w)| (g - w).abs()));
+    let ratio = worst(
+        got.iter()
+            .zip(want)
+            .map(|(g, w)| (g - w).abs() / (abs + rel * w.abs())),
     );
-    let ok = err <= tol && sum_err <= sum_tol;
-    if !ok {
-        eprintln!(
-            "MISMATCH {label}: max error {err:e} (limit {tol:e}), row sum error {sum_err:e} (limit {sum_tol:e})"
-        );
+    // Written so that NaN fails.
+    if ratio <= 1.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "max error {err:e}, worst element {ratio:.3} times its limit (abs {abs:e} + rel {rel:e})"
+        ))
+    }
+}
+
+/// One RMSNorm case, with `eps = 1e-6`. As [`softmax_case`].
+fn rmsnorm_case<E>(name: &str, rows: usize, d: usize, args: &Args) -> Result<bool, KernelError>
+where
+    E: Float + Num,
+    E::Out: Num,
+{
+    const EPS: f64 = 1e-6;
+    let (bm, bd) = tiles::row_tiles(rows, d)?;
+    let xs: Vec<E> = rnd(rows * d, 11).into_iter().map(E::from_f32).collect();
+    let gs: Vec<E> = rnd(d, 12).into_iter().map(E::from_f32).collect();
+    let x = api::copy_host_vec_to_device(&Arc::new(xs.clone()))
+        .sync()?
+        .reshape(&[rows, d])?;
+    let g = api::copy_host_vec_to_device(&Arc::new(gs.clone())).sync()?;
+    let mut y = api::zeros::<E::Out>(&[rows, d]).sync()?;
+
+    let start = Instant::now();
+    rmsnorm_into(&mut y, &x, &g, EPS)?;
+    let first = start.elapsed().as_secs_f64();
+    let label = format!("rmsnorm {name} {rows}x{d}");
+    let tile = format!("{bm}x{bd}");
+    if args.mode == Mode::FirstCallChild {
+        println!("{}", child_line(&label, &tile, first));
+        return Ok(true);
+    }
+    let gpu = time_gpu(args.runs, args.reps, || rmsnorm_into(&mut y, &x, &g, EPS))?;
+
+    let xs64: Vec<f64> = xs.iter().map(|&v| v.to_f64()).collect();
+    let gs64: Vec<f64> = gs.iter().map(|&v| v.to_f64()).collect();
+    let cpu = time_cpu(args.runs, || reference::rmsnorm(&xs64, &gs64, rows, d, EPS));
+
+    let got: Vec<f64> = y
+        .dup()
+        .to_host_vec()
+        .sync()?
+        .into_iter()
+        .map(Num::to_f64)
+        .collect();
+    let want = reference::rmsnorm(&xs64, &gs64, rows, d, EPS);
+    let (abs, rel) = rmsnorm_tolerance::<E>();
+    let verdict = check_close(&got, &want, abs, rel);
+
+    println!("{}", format_line(&label, &tile, gpu, cpu));
+    if let Err(message) = &verdict {
+        eprintln!("MISMATCH {label}: {message}");
+    }
+    Ok(verdict.is_ok())
+}
+
+/// Compares a gather result with the reference, bit for bit. The error is the
+/// text that follows `MISMATCH <case>:`.
+fn check_exact<T: PartialEq + std::fmt::Debug>(got: &[T], want: &[T]) -> Result<(), String> {
+    if got.len() != want.len() {
+        return Err(format!("got {} values, want {}", got.len(), want.len()));
+    }
+    let wrong = got.iter().zip(want).filter(|(g, w)| g != w).count();
+    match got.iter().zip(want).position(|(g, w)| g != w) {
+        None => Ok(()),
+        Some(p) => Err(format!(
+            "{wrong} of {} elements differ, the first at {p}: got {:?}, want {:?}",
+            got.len(),
+            got[p],
+            want[p]
+        )),
+    }
+}
+
+/// One gather case: `n` ids `(i * 7919) % v` from a `[v, d]` table. As
+/// [`softmax_case`].
+fn gather_case<E>(
+    name: &str,
+    v: usize,
+    d: usize,
+    n: usize,
+    args: &Args,
+) -> Result<bool, KernelError>
+where
+    E: DType + Num + PartialEq + std::fmt::Debug,
+{
+    let (bm, bd) = tiles::gather_tiles(n, d)?;
+    let table: Vec<E> = rnd(v * d, 13).into_iter().map(E::from_f32).collect();
+    let ids: Vec<i32> = (0..n).map(|i| ((i * 7919) % v) as i32).collect();
+    let t = api::copy_host_vec_to_device(&Arc::new(table.clone()))
+        .sync()?
+        .reshape(&[v, d])?;
+    let i = api::copy_host_vec_to_device(&Arc::new(ids.clone())).sync()?;
+    let mut y = api::zeros::<E>(&[n, d]).sync()?;
+
+    let start = Instant::now();
+    gather_into(&mut y, &t, &i)?;
+    let first = start.elapsed().as_secs_f64();
+    let label = format!("gather {name} {v}x{d} {n} ids");
+    let tile = format!("{bm}x{bd}");
+    if args.mode == Mode::FirstCallChild {
+        println!("{}", child_line(&label, &tile, first));
+        return Ok(true);
+    }
+    let gpu = time_gpu(args.runs, args.reps, || gather_into(&mut y, &t, &i))?;
+    let zero = E::from_f32(0.0);
+    let cpu = time_cpu(args.runs, || reference::gather(&table, &ids, d, zero));
+
+    let got: Vec<E> = y.dup().to_host_vec().sync()?;
+    let want = reference::gather(&table, &ids, d, zero);
+    let verdict = check_exact(&got, &want);
+
+    println!("{}", format_line(&label, &tile, gpu, cpu));
+    if let Err(message) = &verdict {
+        eprintln!("MISMATCH {label}: {message}");
+    }
+    Ok(verdict.is_ok())
+}
+
+/// The linear test tolerance for this output type: the limit for an element
+/// is `factor * scale + tiny`, where `scale` is the sum of the magnitudes of
+/// its terms.
+fn linear_tolerance<E: Float>() -> (f64, f64) {
+    if <E::Out as DType>::DTYPE == DTypeId::F64 {
+        (16.0 * 2f64.powi(-53), 1e-300)
+    } else {
+        (16.0 * 2f64.powi(-24), 1e-30)
+    }
+}
+
+/// Compares a linear result with the reference, each element within
+/// `factor * scale + tiny`. The error is the text that follows
+/// `MISMATCH <case>:`.
+fn check_scaled(
+    got: &[f64],
+    want: &[f64],
+    scale: &[f64],
+    factor: f64,
+    tiny: f64,
+) -> Result<(), String> {
+    if got.len() != want.len() || scale.len() != want.len() {
+        return Err(format!(
+            "got {} values, want {} with {} scales",
+            got.len(),
+            want.len(),
+            scale.len()
+        ));
+    }
+    let err = worst(got.iter().zip(want).map(|(g, w)| (g - w).abs()));
+    let ratio = worst(
+        got.iter()
+            .zip(want)
+            .zip(scale)
+            .map(|((g, w), s)| (g - w).abs() / (factor * s + tiny)),
+    );
+    // Written so that NaN fails.
+    if ratio <= 1.0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "max error {err:e}, worst element {ratio:.3} times its limit"
+        ))
+    }
+}
+
+fn tile_name(t: LinearTiles, default: LinearTiles) -> String {
+    let name = format!("{}x{}x{}", t.bm, t.bn, t.bk);
+    if t == default {
+        format!("{name} (default)")
+    } else {
+        name
+    }
+}
+
+/// The linear cases for one shape: `x: [m, k]`, `w: [n, k]`, with a bias. The
+/// default tile first, then each of `sweep` that differs from it. The inputs,
+/// the CPU timing and the reference are made once and shared by the tiles,
+/// since none of them depends on the tile. Otherwise as [`softmax_case`].
+fn linear_cases<E>(
+    name: &str,
+    (m, k, n): (usize, usize, usize),
+    sweep: &[LinearTiles],
+    args: &Args,
+) -> Result<bool, KernelError>
+where
+    E: Float + Num,
+    E::Out: Num,
+{
+    let default = LinearTiles::for_shape(m, k, n)?;
+    let mut tiles = vec![default];
+    tiles.extend(sweep.iter().copied().filter(|&t| t != default));
+
+    let xs: Vec<E> = rnd(m * k, 1).into_iter().map(E::from_f32).collect();
+    let ws: Vec<E> = rnd(n * k, 2).into_iter().map(E::from_f32).collect();
+    let bs: Vec<E::Out> = rnd(n, 3)
+        .into_iter()
+        .map(<E::Out as Num>::from_f32)
+        .collect();
+    let upload = |v: Vec<E>, shape: &[usize]| -> Result<Tensor<E>, KernelError> {
+        Ok(api::copy_host_vec_to_device(&Arc::new(v))
+            .sync()?
+            .reshape(shape)?)
+    };
+    let x = upload(xs.clone(), &[m, k])?;
+    let w = upload(ws.clone(), &[n, k])?;
+    let b = api::copy_host_vec_to_device(&Arc::new(bs.clone())).sync()?;
+    let mut y = api::zeros::<E::Out>(&[m, n]).sync()?;
+    let label = format!("linear {name} {m}x{k}x{n}");
+
+    if args.mode == Mode::FirstCallChild {
+        for &t in &tiles {
+            let start = Instant::now();
+            linear_into(&mut y, &x, &w, Some(&b), t)?;
+            let first = start.elapsed().as_secs_f64();
+            println!("{}", child_line(&label, &tile_name(t, default), first));
+        }
+        return Ok(true);
+    }
+
+    let xs64: Vec<f64> = xs.iter().map(|&v| v.to_f64()).collect();
+    let ws64: Vec<f64> = ws.iter().map(|&v| v.to_f64()).collect();
+    let bs64: Vec<f64> = bs.iter().map(|&v| v.to_f64()).collect();
+    let cpu = time_cpu(args.runs, || {
+        reference::linear(&xs64, &ws64, Some(&bs64), m, k, n)
+    });
+    let (want, scale) = reference::linear(&xs64, &ws64, Some(&bs64), m, k, n);
+    let (factor, tiny) = linear_tolerance::<E>();
+
+    let mut ok = true;
+    for &t in &tiles {
+        // the warmup, which includes the compile
+        linear_into(&mut y, &x, &w, Some(&b), t)?;
+        let gpu = time_gpu(args.runs, args.reps, || {
+            linear_into(&mut y, &x, &w, Some(&b), t)
+        })?;
+        let got: Vec<f64> = y
+            .dup()
+            .to_host_vec()
+            .sync()?
+            .into_iter()
+            .map(Num::to_f64)
+            .collect();
+        let verdict = check_scaled(&got, &want, &scale, factor, tiny);
+        println!("{}", format_line(&label, &tile_name(t, default), gpu, cpu));
+        if let Err(message) = &verdict {
+            eprintln!(
+                "MISMATCH {label} tiles {}: {message}",
+                tile_name(t, default)
+            );
+            ok = false;
+        }
     }
     Ok(ok)
 }
 
-fn run(args: &Args) -> Result<bool, KernelError> {
+/// Starts `processes` children that each time the first call of every case.
+fn first_call(args: &Args, processes: usize) -> Result<bool, BoxError> {
     println!(
-        "# {:?}: median of {} runs after a warmup call, {} calls per measurement",
-        args.kernel, args.runs, args.reps
+        "# {}: first call of each case (compile included), after a throwaway kernel has paid the toolchain check; median of {processes} processes",
+        args.kernel.name()
     );
+    let exe = std::env::current_exe()?;
+    let mut cases: Vec<(String, String, Vec<f64>)> = Vec::new();
+    for i in 0..processes {
+        let output = Command::new(&exe)
+            .args([args.kernel.name(), "--first-call-child"])
+            .stderr(Stdio::inherit())
+            .output()?;
+        if !output.status.success() {
+            return Err(
+                format!("process {} of {processes} failed: {}", i + 1, output.status).into(),
+            );
+        }
+        let parsed = parse_child_output(&String::from_utf8_lossy(&output.stdout))?;
+        if i == 0 {
+            cases = parsed
+                .into_iter()
+                .map(|(l, t, s)| (l, t, vec![s]))
+                .collect();
+        } else {
+            if parsed.len() != cases.len() {
+                return Err(format!(
+                    "process {} reported {} cases, the first {}",
+                    i + 1,
+                    parsed.len(),
+                    cases.len()
+                )
+                .into());
+            }
+            for (case, (label, _, seconds)) in cases.iter_mut().zip(parsed) {
+                if case.0 != label {
+                    return Err(
+                        format!("process {} reported {label}, expected {}", i + 1, case.0).into(),
+                    );
+                }
+                case.2.push(seconds);
+            }
+        }
+    }
+    for (label, tiles, seconds) in &cases {
+        println!("{}", format_first_line(label, tiles, seconds));
+    }
+    Ok(true)
+}
+
+fn run(args: &Args) -> Result<bool, BoxError> {
+    if let Mode::FirstCall { processes } = args.mode {
+        return first_call(args, processes);
+    }
+    warm_toolchain()?;
+    if args.mode == Mode::Bench {
+        println!(
+            "# {}: latency is end to end per call (argument checks, kernel cache lookup, launch, wait); median of {} runs after a warmup call, {} calls per measurement",
+            args.kernel.name(),
+            args.runs,
+            args.reps
+        );
+    }
     match args.kernel {
         Kernel::Softmax => {
             let mut ok = softmax_case::<f32>("f32", 4096, 1024, args)?;
             ok &= softmax_case::<f32>("f32", 16, 32768, args)?;
             ok &= softmax_case::<bf16>("bf16", 4096, 1024, args)?;
+            Ok(ok)
+        }
+        Kernel::Rmsnorm => {
+            let mut ok = rmsnorm_case::<f32>("f32", 4096, 1024, args)?;
+            ok &= rmsnorm_case::<bf16>("bf16", 4096, 1024, args)?;
+            ok &= rmsnorm_case::<f32>("f32", 4096, 1000, args)?;
+            Ok(ok)
+        }
+        Kernel::Gather => {
+            let mut ok = gather_case::<f32>("f32", 65536, 1024, 4096, args)?;
+            ok &= gather_case::<bf16>("bf16", 65536, 1024, 4096, args)?;
+            Ok(ok)
+        }
+        Kernel::Linear => {
+            let sweep = [(16, 16, 16), (32, 32, 32), (64, 64, 32), (64, 64, 64)]
+                .map(|(bm, bn, bk)| LinearTiles { bm, bn, bk });
+            let mut ok = linear_cases::<f32>("f32", (256, 1024, 4096), &sweep, args)?;
+            ok &= linear_cases::<bf16>("bf16", (256, 1024, 4096), &[], args)?;
+            ok &= linear_cases::<f32>("f32", (100, 1000, 3000), &[], args)?;
+            ok &= linear_cases::<f32>("f32", (1, 1024, 4096), &[], args)?;
             Ok(ok)
         }
     }
@@ -289,7 +794,8 @@ mod tests {
             Args {
                 kernel: Kernel::Softmax,
                 runs: 5,
-                reps: 20
+                reps: 20,
+                mode: Mode::Bench
             }
         );
     }
@@ -300,6 +806,7 @@ mod tests {
             kernel: Kernel::Softmax,
             runs: 3,
             reps: 7,
+            mode: Mode::Bench,
         };
         assert_eq!(
             args(&["softmax", "--runs", "3", "--reps", "7"]).unwrap(),
@@ -314,7 +821,7 @@ mod tests {
     #[test]
     fn bad_arguments_are_rejected() {
         assert!(args(&[]).unwrap_err().contains("usage"));
-        assert!(args(&["rmsnorm"]).unwrap_err().contains("unknown kernel"));
+        assert!(args(&["matmul"]).unwrap_err().contains("unknown kernel"));
         assert!(
             args(&["softmax", "--bogus"])
                 .unwrap_err()
@@ -354,6 +861,35 @@ mod tests {
     }
 
     #[test]
+    fn first_call_mode_defaults_to_5_processes() {
+        assert_eq!(
+            args(&["softmax", "--first-call"]).unwrap().mode,
+            Mode::FirstCall { processes: 5 }
+        );
+        assert_eq!(
+            args(&["softmax", "--first-call", "--processes", "3"])
+                .unwrap()
+                .mode,
+            Mode::FirstCall { processes: 3 }
+        );
+        assert_eq!(
+            args(&["softmax", "--first-call-child"]).unwrap().mode,
+            Mode::FirstCallChild
+        );
+    }
+
+    #[test]
+    fn first_call_flags_that_do_not_fit_together_are_rejected() {
+        assert!(
+            args(&["softmax", "--processes", "3"])
+                .unwrap_err()
+                .contains("needs --first-call")
+        );
+        assert!(args(&["softmax", "--first-call", "--first-call-child"]).is_err());
+        assert!(args(&["softmax", "--first-call", "--processes", "0"]).is_err());
+    }
+
+    #[test]
     fn a_result_line_has_the_documented_format() {
         let gpu = Stats {
             median: 0.000123,
@@ -366,9 +902,176 @@ mod tests {
             max: 0.047,
         };
         assert_eq!(
-            format_line("softmax f32 4096x1024", "4x1024", 0.31, gpu, cpu),
-            "softmax f32 4096x1024 tiles 4x1024: first 0.31 s | gpu 0.123 ms (min 0.120, max 0.140) | cpu 45.6 ms (min 45.1, max 47.0)"
+            format_line("softmax f32 4096x1024", "4x1024", gpu, cpu),
+            "softmax f32 4096x1024 tiles 4x1024: latency 0.123 ms/call (min 0.120, max 0.140) | cpu 45.6 ms (min 45.1, max 47.0)"
         );
+    }
+
+    #[test]
+    fn a_child_line_survives_the_trip_to_the_parent() {
+        let out = format!(
+            "noise\n{}\n{}\n",
+            child_line("softmax f32 4096x1024", "4x1024", 0.2125),
+            child_line("softmax bf16 4096x1024", "4x1024", 0.18)
+        );
+        assert_eq!(
+            parse_child_output(&out).unwrap(),
+            vec![
+                (
+                    "softmax f32 4096x1024".to_string(),
+                    "4x1024".to_string(),
+                    0.2125
+                ),
+                (
+                    "softmax bf16 4096x1024".to_string(),
+                    "4x1024".to_string(),
+                    0.18
+                ),
+            ]
+        );
+        assert!(parse_child_output("FIRST|a|b").is_err());
+        assert!(parse_child_output("FIRST|a|b|slow").is_err());
+        assert!(parse_child_output("nothing here").unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_first_call_line_reports_median_and_range_over_processes() {
+        assert_eq!(
+            format_first_line(
+                "softmax f32 4096x1024",
+                "4x1024",
+                &[0.25, 0.20, 0.22, 0.30, 0.21]
+            ),
+            "softmax f32 4096x1024 tiles 4x1024: first call 0.22 s (min 0.20, max 0.30) over 5 processes"
+        );
+    }
+
+    #[test]
+    fn rmsnorm_is_a_kernel() {
+        assert_eq!(args(&["rmsnorm"]).unwrap().kernel, Kernel::Rmsnorm);
+        assert_eq!(Kernel::Rmsnorm.name(), "rmsnorm");
+    }
+
+    #[test]
+    fn gather_is_a_kernel() {
+        assert_eq!(args(&["gather"]).unwrap().kernel, Kernel::Gather);
+        assert_eq!(Kernel::Gather.name(), "gather");
+    }
+
+    #[test]
+    fn check_exact_finds_one_wrong_element() {
+        assert!(check_exact(&[1u8, 2, 3], &[1, 2, 3]).is_ok());
+        let message = check_exact(&[1u8, 9, 3], &[1, 2, 3]).unwrap_err();
+        assert!(
+            message.starts_with("1 of 3 elements differ, the first at 1"),
+            "{message}"
+        );
+        assert!(check_exact(&[1u8, 2], &[1, 2, 3]).is_err());
+        assert!(check_exact(&[f32::NAN], &[f32::NAN]).is_err());
+    }
+
+    #[test]
+    fn linear_is_a_kernel() {
+        assert_eq!(args(&["linear"]).unwrap().kernel, Kernel::Linear);
+        assert_eq!(Kernel::Linear.name(), "linear");
+    }
+
+    #[test]
+    fn check_scaled_scales_the_limit_per_element() {
+        let want = [10.0, 0.0];
+        let scale = [100.0, 1.0];
+        // 1e-3 off is outside 1e-6 * 100 = 1e-4
+        assert!(check_scaled(&[10.001, 0.0], &want, &scale, 1e-6, 1e-30).is_err());
+        // 5e-5 off is inside it
+        assert!(check_scaled(&[10.00005, 0.0], &want, &scale, 1e-6, 1e-30).is_ok());
+        // the same 5e-5 on an element of scale 1 is outside 1e-6
+        let message = check_scaled(&[10.0, 0.00005], &want, &scale, 1e-6, 1e-30).unwrap_err();
+        assert!(message.starts_with("max error "), "{message}");
+    }
+
+    #[test]
+    fn check_scaled_fails_on_nan_and_a_wrong_length() {
+        assert!(check_scaled(&[f64::NAN], &[1.0], &[1.0], 1e-6, 1e-30).is_err());
+        assert!(check_scaled(&[1.0], &[1.0, 2.0], &[1.0, 1.0], 1e-6, 1e-30).is_err());
+    }
+
+    #[test]
+    fn the_default_tile_is_marked_in_the_sweep() {
+        let d = LinearTiles {
+            bm: 64,
+            bn: 64,
+            bk: 32,
+        };
+        assert_eq!(tile_name(d, d), "64x64x32 (default)");
+        assert_eq!(
+            tile_name(
+                LinearTiles {
+                    bm: 16,
+                    bn: 16,
+                    bk: 16
+                },
+                d
+            ),
+            "16x16x16"
+        );
+    }
+
+    #[test]
+    fn check_close_allows_the_relative_part_of_the_limit() {
+        let want = [1000.0, 0.001];
+        // 4e-3 off at 1000 is inside 1e-6 + 1e-5 * 1000 = 0.010001
+        assert!(check_close(&[1000.004, 0.001], &want, 1e-6, 1e-5).is_ok());
+        // the same error at 0.001 is far outside 1e-6 + 1e-8
+        let message = check_close(&[1000.0, 0.005], &want, 1e-6, 1e-5).unwrap_err();
+        assert!(message.starts_with("max error "), "{message}");
+    }
+
+    #[test]
+    fn check_close_fails_on_nan_and_a_wrong_length() {
+        assert!(check_close(&[f64::NAN, 1.0], &[1.0, 1.0], 1e-6, 1e-5).is_err());
+        assert!(check_close(&[1.0], &[1.0, 1.0], 1e-6, 1e-5).is_err());
+        assert!(check_close(&[1.0, 2.0], &[1.0, 2.0], 1e-6, 1e-5).is_ok());
+    }
+
+    fn softmax_row() -> Vec<f64> {
+        vec![0.1, 0.2, 0.3, 0.4]
+    }
+
+    #[test]
+    fn a_correct_result_passes() {
+        let want = softmax_row();
+        assert!(check_softmax(&want, &want, 4, 1e-6, 1e-5).is_ok());
+    }
+
+    #[test]
+    fn a_wrong_element_is_a_mismatch() {
+        let want = softmax_row();
+        let mut got = want.clone();
+        got[1] += 1e-3;
+        got[2] -= 1e-3; // the row still sums to 1: only the element check can catch it
+        let message = check_softmax(&got, &want, 4, 1e-6, 1e-5).unwrap_err();
+        assert!(message.starts_with("max error "), "{message}");
+        // with a looser limit it passes, so it was the element check that failed
+        assert!(check_softmax(&got, &want, 4, 1e-2, 1e-5).is_ok());
+    }
+
+    #[test]
+    fn a_row_that_does_not_sum_to_one_is_a_mismatch() {
+        let want = softmax_row();
+        let got: Vec<f64> = want.iter().map(|v| v * 1.001).collect();
+        // each element is within 4e-4 of the reference, so allow that
+        let message = check_softmax(&got, &want, 4, 1e-3, 1e-5).unwrap_err();
+        assert!(message.contains("row sum error"), "{message}");
+    }
+
+    #[test]
+    fn nan_and_a_wrong_length_are_mismatches() {
+        let want = softmax_row();
+        let mut got = want.clone();
+        got[0] = f64::NAN;
+        assert!(check_softmax(&got, &want, 4, 1e-6, 1e-5).is_err());
+        assert!(check_softmax(&[f64::NAN; 4], &want, 4, 1e-6, 1e-5).is_err());
+        assert!(check_softmax(&want[..3], &want, 4, 1e-6, 1e-5).is_err());
     }
 
     #[test]

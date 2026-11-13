@@ -32,8 +32,11 @@ Rules for whoever implements a step:
 | Step | State |
 |---|---|
 | 1 | Done, `ae60794`. |
-| 2 | Done: code and tests `7d64bab`, README `169bcaa`. |
-| 3 to 8 | Not started. |
+| 2 | Done: code, tests, review fixes and README table. |
+| 3 | Done: code, tests and README table. |
+| 4 | Done: code, tests and README table. |
+| 5 | Done: code, tests and README table. The tile sweep kept the default 64 × 64 × 32 (32 × 32 × 32 was 3% slower, 16³ and 64 × 64 × 64 about twice as slow). |
+| 6 to 8 | Not started. |
 
 ## State on 2026-11-13
 
@@ -181,10 +184,13 @@ kernels::softmax_f32((&mut *y).partition([bm, bn]), x)
 
 The kernels for F64 are separate, non-generic entries (`*_f64`), because the
 accumulator type and the constants differ. A wrapper picks the entry for `E`
-through a `#[doc(hidden)]` method on `Float`, one per computing kernel, as
-step 2 did with `launch_softmax` (decision 1 under "Open questions"). Steps 3
-and 5 add `launch_rmsnorm` and `launch_linear` the same way. Gather needs
-none: it has one entry, generic over any `DType`.
+through a method on the sealed supertrait `sealed::Sealed`, one per computing
+kernel, as step 2 did with `launch_softmax` (decision 1 under "Open
+questions"). The trait lives in a module no other crate can name, so the
+methods are crate-private; `Float` is `pub trait Float: sealed::Sealed {}`,
+and the output type is `<E as Float>::Out`, declared on `Sealed`. Steps 3 and
+5 add `launch_rmsnorm` and `launch_linear` there. Gather needs none: it has
+one entry, generic over any `DType`.
 
 ### Tile-shape rules (`tiles.rs`)
 
@@ -534,29 +540,50 @@ Benchmark baselines: `reference::linear`, and the kernel itself at tiles
 `cargo run --release -p tilekernels --example kernelbench -- <kernel>
 [--runs N] [--reps R]`, where `<kernel>` is `softmax`, `rmsnorm`, `gather` or
 `linear`. Defaults: `--runs 5`, `--reps 20`. Each step adds its subcommand.
+With `--first-call [--processes N]` (default 5) it measures first calls
+instead, see below.
+
+Before anything is timed, a throwaway kernel (F32, a 1 × 1 tile, which no
+case uses) is compiled and launched, so that cutile's one-time check of the
+toolchain, done when the first kernel of a process is compiled, is not part
+of any case. Each step's example keeps the throwaway kernel valid by
+launching one of its own kernels at a 1 × 1 tile.
 
 For each case of the kernel:
 
 1. Build the inputs on the host with the same xorshift generator as the
    tests, upload them, and allocate the output. Not timed.
-2. **First call**: time one `_into` call. It includes the JIT. It is the
-   warmup and is reported on its own, never in a median.
-3. **GPU**: `runs` measurements. One measurement is the wall time of `reps`
-   consecutive `_into` calls divided by `reps`. Every call waits for its
-   kernel (fact 7).
+2. **Warmup**: one `_into` call, which includes the JIT. It is not reported
+   here (see "First call" below).
+3. **Latency**: `runs` measurements. One measurement is the wall time of
+   `reps` consecutive `_into` calls divided by `reps`. A call is the whole
+   `_into`: argument checks, kernel cache lookup, launch, and waiting for the
+   stream (fact 7). It is not kernel time, and the README must not call it
+   that.
 4. **CPU**: one unreported warmup call of the reference, then `runs` timed
    calls on the same data, already converted to `f64` (the conversion is not
    timed).
 5. Print one line per case:
 
 ```
-softmax f32 4096x1024 tiles 4x1024: first 0.31 s | gpu 0.123 ms (min 0.120, max 0.140) | cpu 45.6 ms (min 45.1, max 47.0)
+softmax f32 4096x1024 tiles 4x1024: latency 0.123 ms/call (min 0.120, max 0.140) | cpu 45.6 ms (min 45.1, max 47.0)
 ```
 
-(The numbers in that line are placeholders that show the format.) `gpu` and
-`cpu` are medians. Nothing is excluded except the warmups named above. The
+(The numbers in that line are placeholders that show the format.) `latency`
+and `cpu` are medians. Nothing is excluded except the warmups named above. The
 output of the last GPU call is checked against the reference with the test
-tolerance, and a mismatch makes the example exit non-zero.
+tolerance, and a mismatch prints `MISMATCH <case>: ...` and makes the
+example exit non-zero. A NaN in the result is a mismatch.
+
+**First call.** A compile happens once per process, so it is measured over
+processes: `--first-call` starts `--processes` copies of the program, each of
+which times only the first call of every case (after the throwaway kernel),
+and prints one line per case with the median, min and max over the
+processes:
+
+```
+softmax f32 4096x1024 tiles 4x1024: first call 0.22 s (min 0.20, max 0.30) over 5 processes
+```
 
 Cases:
 
@@ -571,9 +598,11 @@ The example's argument parsing and its median function have unit tests, like
 `overbudget` (`[[example]] name = "kernelbench" test = true` in
 `tilekernels/Cargo.toml`).
 
-What a README table for a kernel step contains: the cases as rows; first
-call, GPU median and CPU median as columns; the date, GPU and "median of 5
-after a warmup call, 20 calls per measurement" in the caption. The "what
+What a README table for a kernel step contains: the cases as rows; latency
+per call and CPU median as columns, and the first call (median and range over
+5 processes) in the same table or one beside it; the date, GPU and "median of
+5 after a warmup call, 20 calls per measurement" in the caption, and a
+sentence saying what a call includes. The "what
 this shows" paragraph may say how the kernel compares with the single-threaded
 CPU loop, and must say that the CPU loop is a naive baseline, not an
 optimized library. Tile-shape or element-type differences inside ±10% are
@@ -791,7 +820,7 @@ and 7 do not depend on the kernels.
 | Step | What | Tests | Benchmark and README |
 |---|---|---|---|
 | 1 | The `tilekernels` crate: `Cargo.toml`, workspace member, `KernelError`, `Float`, `tiles.rs`, `reference.rs`. No kernel yet. | Unit tests, no GPU: `tiles.rs` (each rule at 1, a power of two, one over, one under; the 16,777,216 limit) and `reference.rs` (softmax of `[0, ln 2]` is `[1/3, 2/3]`; rmsnorm of `[3, 4]` with gain 1 and eps 0 is `[3, 4] / sqrt(12.5)`; gather with an out-of-range id; linear of a 2 × 3 by 2 × 3 case worked by hand, with its scale). | None. README: add the crate to the Crates table as "CPU references and tile-shape rules for the kernels; kernels follow", and link this document next to the feasibility report. |
-| 2 | Softmax: kernel entries, `softmax`, `softmax_into`, `tests/common/mod.rs`, `tests/softmax.rs`, the `kernelbench` example with the `softmax` subcommand. | "Softmax" above, plus the example's unit tests. | `kernelbench -- softmax`. README: a `tilekernels` section with the softmax table, and Limitations for it (one tile per row, first-call time for wide rows as measured by `wide_row`). |
+| 2 | Softmax: kernel entries, `softmax`, `softmax_into`, `tests/common/mod.rs`, `tests/softmax.rs`, the `kernelbench` example with the `softmax` subcommand. | "Softmax" above, plus the example's unit tests. | `kernelbench -- softmax`. README: a `tilekernels` section with the softmax table, and Limitations for it (one tile per row; the first call's compile time grows with the row width, without the `wide_row` number, see decision 5). |
 | 3 | RMSNorm. | "RMSNorm" above. | `kernelbench -- rmsnorm`. README table. |
 | 4 | Embedding gather. | "Embedding gather" above. | `kernelbench -- gather`. README table; Limitations: I32 ids only, out-of-range ids give zeros, the whole table must be resident. |
 | 5 | Linear. | "Linear" above. | `kernelbench -- linear`. README table including the tile sweep; change `for_shape`'s default only as "Tile-shape rules" allows, and say which shape was kept. Limitations: F32 output for BF16 input. |
@@ -804,6 +833,7 @@ the printed lines:
 
 ```sh
 cargo run --release -p tilekernels --example kernelbench -- <kernel>
+cargo run --release -p tilekernels --example kernelbench -- <kernel> --first-call
 ```
 
 For steps 6 and 7 the lines to paste back are `overbudget`'s `time`,
@@ -826,7 +856,12 @@ so later steps do not have to ask.
    sealed trait cannot name `Float::Out`, so the method has to sit on
    `Float`; the trait is sealed, so no other crate can implement it, and the
    method is `#[doc(hidden)]`. Later computing kernels do the same. The
-   "Common API" section now says this.
+   "Common API" section now says this. **Revised after review:** the method
+   was still public, and called directly it skips every check (a `bn` smaller
+   than the row silently normalizes each column tile on its own). The method
+   and the output type now live on `sealed::Sealed`, which no other crate can
+   name, and `Float` is an empty trait over it. A trait item cannot be
+   `pub(crate)` in Rust; this is the way to get the same effect.
 2. **`kernelbench` has its own copy of the xorshift generator, of the `Num`
    conversion trait and of the softmax tolerance,** because an example cannot
    use `tests/common`. Accepted. Do not move them into the library's public
@@ -842,5 +877,9 @@ so later steps do not have to ask.
    code commit comes first and the README commit after the numbers, as the
    rules at the top now say.
 5. **`wide_row` measured 21.5 s including the first compile** (max error
-   `3.0e-11`), in a debug test build, once. Step 2's README limitation may
-   quote it as a single observation of the first call, not as a median.
+   `3.0e-11`), in a debug test build, once. **Revised after review:** that
+   number stays out of the README. It may go in only after it has been
+   measured as a release-build median over 5 processes (a `--first-call`
+   case for the `3 × 248,320` row, which no step adds yet); until then the
+   README says only that the first call's compile time grows with the row
+   width.

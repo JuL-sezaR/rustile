@@ -22,7 +22,7 @@ the design for the tile kernels and the manager changes they need is in
 | Crate | What it is |
 |---|---|
 | [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
-| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax so far. |
+| [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax, RMSNorm, embedding gather and a linear layer. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
 ## Milestone 1: run a working set larger than the budget
@@ -399,7 +399,8 @@ write-back).
 `tilekernels` holds kernels written in cuTile Rust, each tested against a
 single-threaded CPU loop in `f64` (`tilekernels/src/reference.rs`). The
 design, and the order they are built in, is in
-[docs/design/kernels.md](docs/design/kernels.md). So far: softmax.
+[docs/design/kernels.md](docs/design/kernels.md). The four kernels it was designed with are there: softmax, RMSNorm,
+embedding gather and a linear layer.
 
 ### Softmax
 
@@ -412,35 +413,172 @@ for F64.
 
 ```sh
 cargo run --release -p tilekernels --example kernelbench -- softmax
+cargo run --release -p tilekernels --example kernelbench -- softmax --first-call
 ```
 
-RTX 5080 Laptop, WSL2, 2026-11-13. GPU and CPU are medians of 5 measurements
-after a warmup call, with min to max in brackets; a GPU measurement is the
-average of 20 calls, each waiting for its kernel. First call is that warmup:
-one observation per case, including the JIT compile.
+The first command measures latency per call. RTX 5080 Laptop, WSL2,
+2026-11-14. Latency and CPU are medians of 5 measurements after a warmup
+call, with min to max in brackets. A measurement is the average of 20 calls.
+Latency is end to end for one `softmax_into` call: the argument checks, the
+kernel cache lookup, the launch, and waiting for the stream. It is not the
+kernel's own time. The second command measures the first call of each case,
+which includes compiling the kernel, in 5 separate processes (median, min to
+max). A kernel for another case is compiled first in each process, so
+cutile's one-time check of the toolchain is not counted.
 
-| Case | Tile | First call | GPU, per call | CPU reference |
+| Case | Tile | First call | Latency per call | CPU reference |
 |---|---|---|---|---|
-| F32, 4096 × 1024 | 4 × 1024 | 0.22 s | 0.086 ms (0.084 to 0.095) | 19.3 ms (19.0 to 20.3) |
-| F32, 16 × 32768 | 1 × 32768 | 0.68 s | 0.077 ms (0.074 to 0.078) | 1.5 ms (1.5 to 1.7) |
-| BF16 in, 4096 × 1024 | 4 × 1024 | 0.18 s | 0.084 ms (0.082 to 0.087) | 20.4 ms (19.8 to 21.5) |
+| F32, 4096 × 1024 | 4 × 1024 | 0.22 s (0.22 to 0.22) | 0.106 ms (0.105 to 0.112) | 22.0 ms (21.7 to 22.4) |
+| F32, 16 × 32768 | 1 × 32768 | 0.80 s (0.79 to 0.82) | 0.069 ms (0.066 to 0.075) | 1.8 ms (1.7 to 2.1) |
+| BF16 in, 4096 × 1024 | 4 × 1024 | 0.20 s (0.20 to 0.20) | 0.081 ms (0.078 to 0.089) | 21.8 ms (21.5 to 22.0) |
 
 What this shows:
 
-- **The GPU time does not follow the size.** 16 × 32768 has an eighth of
-  the elements of 4096 × 1024 and takes 0.077 ms against 0.086 ms, a
-  difference inside the variance. So most of the 0.08 ms is what any call
-  costs: checking the arguments, launching, and waiting for the stream. The
-  column is per-call latency; the kernel's own time is not measured here.
-- **BF16 input costs the same as F32** (0.084 against 0.086 ms).
-- **Against the CPU loop**, a call is about 220 times faster at
-  4096 × 1024 and 19 times at 16 × 32768. The CPU loop is a naive
+- **The latency barely follows the size.** 16 × 32768 has an eighth of the
+  elements of 4096 × 1024 and takes 0.069 ms against 0.106 ms, a third
+  less, not an eighth. So most of the 0.07 to 0.1 ms is what any call costs,
+  not the kernel's work, and this column cannot say how fast the kernel
+  itself is.
+- **BF16 against F32 is not settled.** In this run BF16 input is 24% lower
+  (0.081 against 0.106 ms), which is outside the run-to-run variance and fits
+  it reading half the bytes. A run on 2026-11-13 gave 0.084 and 0.086 ms,
+  no difference, and the F32 figure itself moved from 0.086 to 0.106 ms
+  between the two runs. So differences smaller than about 25% between cases
+  are not claimed.
+- **Against the CPU loop**, a call is about 200 times faster at
+  4096 × 1024 and about 26 times at 16 × 32768. The CPU loop is a naive
   single-threaded baseline in `f64`, not an optimized library, so the ratios
   show the kernel is worth having, not how fast softmax can be.
-- **The first call is the compile**: 0.18 to 0.22 s for a 4096-element tile
-  and 0.68 s for a 32,768-element one. The first case also pays cutile's
-  check of the toolchain, which runs once per process, so its 0.22 s is not
-  directly comparable with the 0.18 s of the BF16 case.
+- **The first call is the compile**: 0.20 to 0.22 s for a 4096-element tile
+  and 0.80 s for a 32,768-element one, steady from process to process (the
+  ranges are 0.01 to 0.03 s wide).
+
+### RMSNorm
+
+`tilekernels::rmsnorm(&x, &gain, eps)` computes
+`x / sqrt(mean(x²) + eps) * gain` along each row of a `[rows, d]` tensor,
+with `gain` of length `d`. Element types and tiles are as for softmax. The
+tests hold every element to within `1e-6 + 1e-5 × |reference|` for F32
+output and `1e-12 + 1e-12 × |reference|` for F64; the worst element in any
+test reached 1.6% of its limit.
+
+```sh
+cargo run --release -p tilekernels --example kernelbench -- rmsnorm
+cargo run --release -p tilekernels --example kernelbench -- rmsnorm --first-call
+```
+
+RTX 5080 Laptop, WSL2, 2026-11-14, `eps = 1e-6`, measured as for softmax.
+
+| Case | Tile | First call | Latency per call | CPU reference |
+|---|---|---|---|---|
+| F32, 4096 × 1024 | 4 × 1024 | 0.21 s (0.21 to 0.22) | 0.098 ms (0.083 to 0.103) | 12.6 ms (11.9 to 14.2) |
+| BF16 in, 4096 × 1024 | 4 × 1024 | 0.19 s (0.19 to 0.19) | 0.057 ms (0.046 to 0.069) | 12.7 ms (12.6 to 12.9) |
+| F32, 4096 × 1000 | 4 × 1024 | 0.21 s (0.21 to 0.21) | 0.064 ms (0.058 to 0.066) | 6.2 ms (4.7 to 9.5) |
+
+What this shows:
+
+- **The cases cannot be compared with each other.** F32 4096 × 1000 runs
+  the same tile as F32 4096 × 1024 on 2% fewer elements, yet its latency is
+  35% lower, and its CPU reference took half the time on the same 2% less
+  work. That is the machine changing between cases, not the code. So the
+  BF16 case being 42% lower than F32 4096 × 1024 is not claimed either; the
+  softmax runs above disagreed with each other about BF16 too.
+- **Against the CPU loop**, a call is about 100 to 220 times faster. As for
+  softmax, the CPU loop is a naive single-threaded baseline in `f64`, so
+  this shows the kernel is worth having, not how fast RMSNorm can be.
+- **The first call is the compile**: 0.19 to 0.21 s, steady from process to
+  process, about what the softmax kernels with a 4096-element tile take.
+
+### Embedding gather
+
+`tilekernels::gather(&table, &ids)` returns the rows of a `[v, d]` table
+picked by a vector of `i32` ids, for any element type. A block copies up to
+16 ids by up to 256 columns. An id outside `0..v` gives a row of zeros: the
+ids are on the device, and checking them would cost a copy back. The tests
+compare every element bit for bit for BF16, F32, F64, I64 and U8, including
+ids just outside the table and as far out as `i32::MIN` and `i32::MAX`.
+
+```sh
+cargo run --release -p tilekernels --example kernelbench -- gather
+cargo run --release -p tilekernels --example kernelbench -- gather --first-call
+```
+
+RTX 5080 Laptop, WSL2, 2026-11-14, measured as for softmax. Each case
+gathers 4096 ids, `(i × 7919) mod 65536`, from a 65536 × 1024 table (256 MiB
+in F32).
+
+| Case | Tile | First call | Latency per call | CPU reference |
+|---|---|---|---|---|
+| F32 | 16 × 256 | 0.16 s (0.16 to 0.16) | 0.041 ms (0.039 to 0.056) | 1.9 ms (1.3 to 7.6) |
+| BF16 | 16 × 256 | 0.16 s (0.16 to 0.16) | 0.077 ms (0.064 to 0.100) | 0.5 ms (0.4 to 1.0) |
+
+What this shows:
+
+- **This is a warm gather.** Every call reads the same 4096 rows (16 MiB in
+  F32) and writes the same 16 MiB of output, so after the first call they may
+  come from the GPU's L2 cache. The latency says what a repeated gather of
+  the same rows costs, not what a gather that reads the table from memory
+  costs. Not measured: a gather with different ids on every call.
+- **BF16 against F32 is not claimed.** BF16 moves half the bytes and measured
+  higher (0.077 against 0.041 ms), with a wide spread; the cases are not
+  comparable with each other to better than about 35% (issue #12).
+- **The CPU reference is a plain row copy**, not a computation. It also
+  allocates the output on every call, and its spread is wide (1.3 to 7.6 ms
+  for F32). The ratio to it (about 46 times for F32, 6 for BF16) says little.
+- **The first call is the compile**: 0.16 s, the same in every process, a
+  little less than softmax and RMSNorm with their 4096-element tiles.
+
+### Linear
+
+`tilekernels::linear(&x, &w, bias)` computes `x @ wᵀ + bias` for `x` of
+`[m, k]` and `w` of `[n, k]`, one row per output as weight files store it,
+so no transposed copy is made. BF16 and F32 input give F32 output, F64 gives
+F64. Each block computes a `bm × bn` output tile with tensor-core `mma`,
+stepping `bk` along `k`. The tests hold each element to within
+`16 × unit roundoff × Σ|terms|` of the reference; the worst F32 element
+reached 16% of that, BF16 9%, and F64 was exact.
+
+```sh
+cargo run --release -p tilekernels --example kernelbench -- linear
+cargo run --release -p tilekernels --example kernelbench -- linear --first-call
+```
+
+RTX 5080 Laptop, WSL2, 2026-11-14, with a bias, measured as for softmax.
+The CPU reference was timed once per shape and is shared by the tiles of the
+sweep. TFLOP/s counts `2 m k n` operations against the latency per call, so
+it understates what the kernel alone does.
+
+| Case | Tile | First call | Latency per call | TFLOP/s | CPU reference |
+|---|---|---|---|---|---|
+| F32, 256 × 1024 × 4096 | 64 × 64 × 32 (default) | 0.33 s (0.33 to 0.34) | 1.216 ms (1.180 to 1.232) | 1.8 | 937 ms (926 to 971) |
+| F32, same | 16 × 16 × 16 | 0.19 s (0.19 to 0.19) | 2.497 ms (2.452 to 2.512) | 0.9 | (same) |
+| F32, same | 32 × 32 × 32 | 0.24 s (0.23 to 0.24) | 1.257 ms (1.222 to 1.279) | 1.7 | (same) |
+| F32, same | 64 × 64 × 64 | 0.65 s (0.64 to 0.65) | 2.312 ms (1.811 to 2.349) | 0.9 | (same) |
+| BF16 in, 256 × 1024 × 4096 | 64 × 64 × 32 (default) | 0.25 s (0.25 to 0.27) | 0.082 ms (0.075 to 0.087) | 26 | 923 ms (915 to 931) |
+| F32, 100 × 1000 × 3000 | 64 × 64 × 32 (default) | 0.33 s (0.32 to 0.34) | 0.548 ms (0.519 to 0.552) | 1.1 | 206 ms (193 to 212) |
+| F32, 1 × 1024 × 4096 | 16 × 64 × 32 (default) | 0.24 s (0.24 to 0.24) | 0.150 ms (0.144 to 0.167) | 0.06 | 3.7 ms (3.4 to 3.9) |
+
+What this shows:
+
+- **The default tile stays.** 32 × 32 × 32 is 3% slower than 64 × 64 × 32,
+  which is no difference. 16 × 16 × 16 and 64 × 64 × 64 take about twice as
+  long, outside any variance seen so far.
+- **BF16 input is about 15 times faster than F32** on the same shape
+  (0.082 against 1.216 ms), far more than the noise between cases (issue
+  #12). The F32 results are accurate to F32 rounding, well inside a
+  tolerance that single-pass TF32 would fail by a factor of hundreds, so the
+  F32 kernel is not taking BF16's fast path. Which instructions each one
+  compiles to was not checked. BF16's 0.082 ms is close to the per-call cost
+  seen for the other kernels, so its kernel time may be smaller still.
+- **One input row is mostly overhead.** `m = 1` pads to a 16-row tile, and
+  0.150 ms moves 16 MiB of F32 weight for 8 million operations.
+- **The first call grows with the tile**: from 0.19 s at 16³ to 0.65 s at
+  64 × 64 × 64, steady from process to process.
+- **Against the CPU loop**, F32 is about 770 times faster and BF16 about
+  11,000 times. The CPU loop is a naive single-threaded baseline in `f64`
+  that also sums the magnitudes of the terms for the test tolerance, about
+  twice the work a plain product needs, so these ratios are not a speed
+  claim.
 
 ## Limitations
 
@@ -477,12 +615,25 @@ What this shows:
   cheaper (about 0.3 ms per MiB either way).
 - A failed prefetch on the copy stream is reported by the next
   `ensure_resident` of that tensor, which leaves it spilled.
-- Softmax needs a row to fit in one tile (at most 16,777,216 columns): in
+- Softmax and RMSNorm need a row to fit in one tile (at most 16,777,216 columns): in
   cutile 0.4 a block can only store its own tile, so a row cannot be reduced
   across blocks. The first call's compile time grows with the row width
-  (0.68 s at 32,768 columns above).
+  (0.20 s for a 4096-element tile, 0.80 s for 32,768).
 - The kernels write F32 for BF16 input; there is no BF16 output.
-- The kernels' first-call times are single observations, not medians.
+- The F32 linear layer reaches 1.8 TFLOP/s against about 26 for BF16 input
+  on the same shape.
+- The linear layer pads a short input to a 16-row tile, so `m = 1` uses a
+  sixteenth of each block's work.
+- Gather takes `i32` ids only: cutile 0.4 cannot narrow `i64` to `i32` in a
+  kernel. An id outside the table gives a row of zeros, not an error.
+- Gather needs the whole table on the device; the manager moves whole
+  tensors, so it cannot keep only the rows in use resident.
+- The gather benchmark reads the same rows on every call, so it may measure
+  a cache-warm gather.
+- `kernelbench` cases are not comparable with each other to better than
+  about 35%: one case of the RMSNorm run was 35% faster than another doing
+  the same work, on the GPU and on the CPU alike. Only a case's own spread
+  (min to max) is narrow.
 - The kernels do not run on tensors the manager holds yet.
 
 ## Building
