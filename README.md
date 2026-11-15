@@ -439,12 +439,12 @@ What this shows:
   less, not an eighth. So most of the 0.07 to 0.1 ms is what any call costs,
   not the kernel's work, and this column cannot say how fast the kernel
   itself is.
-- **BF16 against F32 is not settled.** In this run BF16 input is 24% lower
-  (0.081 against 0.106 ms), which is outside the run-to-run variance and fits
-  it reading half the bytes. A run on 2026-11-13 gave 0.084 and 0.086 ms,
-  no difference, and the F32 figure itself moved from 0.086 to 0.106 ms
-  between the two runs. So differences smaller than about 25% between cases
-  are not claimed.
+- **BF16 against F32 is not claimed.** In this run BF16 input is 24% lower
+  (0.081 against 0.106 ms), which would fit it reading half the bytes. But
+  cases are not comparable with each other to better than about 35% (see
+  Limitations and issue #12), and a run on 2026-11-13 gave 0.084 and
+  0.086 ms, no difference, while the F32 figure itself moved from 0.086 to
+  0.106 ms between the two runs.
 - **Against the CPU loop**, a call is about 200 times faster at
   4096 × 1024 and about 26 times at 16 × 32768. The CPU loop is a naive
   single-threaded baseline in `f64`, not an optimized library, so the ratios
@@ -480,9 +480,10 @@ What this shows:
 - **The cases cannot be compared with each other.** F32 4096 × 1000 runs
   the same tile as F32 4096 × 1024 on 2% fewer elements, yet its latency is
   35% lower, and its CPU reference took half the time on the same 2% less
-  work. That is the machine changing between cases, not the code. So the
-  BF16 case being 42% lower than F32 4096 × 1024 is not claimed either; the
-  softmax runs above disagreed with each other about BF16 too.
+  work. That is the machine changing between cases, not the code. The BF16
+  case being 42% lower than F32 4096 × 1024 is only a little beyond that
+  35%, and the softmax runs above disagreed with each other about BF16 too,
+  so it is not claimed either.
 - **Against the CPU loop**, a call is about 100 to 220 times faster. As for
   softmax, the CPU loop is a naive single-threaded baseline in `f64`, so
   this shows the kernel is worth having, not how fast RMSNorm can be.
@@ -533,8 +534,8 @@ What this shows:
 `tilekernels::linear(&x, &w, bias)` computes `x @ wᵀ + bias` for `x` of
 `[m, k]` and `w` of `[n, k]`, one row per output as weight files store it,
 so no transposed copy is made. BF16 and F32 input give F32 output, F64 gives
-F64. Each block computes a `bm × bn` output tile with tensor-core `mma`,
-stepping `bk` along `k`. The tests hold each element to within
+F64. Each block computes a `bm × bn` output tile with cuTile's `mma`
+operation, stepping `bk` along `k`. The tests hold each element to within
 `16 × unit roundoff × Σ|terms|` of the reference; the worst F32 element
 reached 16% of that, BF16 9%, and F64 was exact.
 
