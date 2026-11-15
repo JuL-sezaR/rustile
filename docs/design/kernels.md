@@ -612,10 +612,16 @@ reported as no difference.
 
 ### One manager for every element type (step 6)
 
+Branch: start from `main` (a new branch, say `manager-any-dtype`); step 6
+does not touch `tilekernels`, so it does not depend on any open pull request.
+
 `Manager<T>` becomes `Manager`. The methods that touch a tensor take the
-element type instead:
+element type instead. `Backing<T>` stays a public generic enum, because the
+caller's rebuild closure is typed.
 
 ```rust
+use cutile::DTypeId;   // not in cutile's prelude
+
 impl Manager {
     pub fn register<T: DType>(&mut self, tensor: Tensor<T>, hint: Hint) -> Result<TensorId, TierError>;
     pub fn register_reconstructible<T: DType>(&mut self, tensor: Tensor<T>, hint: Hint,
@@ -631,79 +637,202 @@ impl Manager {
 }
 ```
 
-- New error `TierError::WrongDType { id, stored: DTypeId, requested: DTypeId }`,
-  not recoverable. `tensor`, `tensor_mut` and `unregister` return it when `T`
-  is not the type the tensor was registered with, before changing anything
-  (`unregister` leaves the tensor registered; `tensor_mut` does not drop the
-  clean copy).
-- `EntrySnapshot` gains `dtype: DTypeId`, and `Snapshot`'s `Display` prints
-  it.
-- **Element size and the budget.** A tensor's size is `tensor.num_bytes()`,
-  elements times `size_of::<T>()`, which the manager already uses. The
-  budget, the soft limit, the host limit and every `Stats` field stay in
-  bytes, so a `[1024]` BF16 tensor counts 2048 bytes and a `[1024]` F64
-  tensor 8192, and they evict each other under the one budget. Nothing in
-  the policy looks at the element type.
-- **The pool.** `HostPool` and `HostBlock` are already byte-based and
-  unaligned; they do not change.
-- **Copies.** A copy needs no element type, only bytes:
-  - `SaveToHost { keep, src, bytes, host }`: `keep` is the erased tensor,
-    retained until the copy completes; `src` is its `CUdeviceptr`; the copy is
-    `memcpy_dtoh_async::<u8>(host.as_ptr(), src, bytes, ..)`.
-  - `LoadFromHost { host, ops }` allocates through `ops.alloc` and copies
-    `host.bytes()` bytes with `memcpy_htod_async::<u8>`. Its output is the
-    erased 1-D tensor, which the manager reshapes through `ops.reshape`.
-- **Suggested internals** (anything with the same public behavior is fine):
-  the entry stores the device tensor as `Arc<dyn Any + Send + Sync>` that is
-  always an `Arc<Tensor<T>>`, plus a small `Copy` table of function pointers
-  made by a generic `fn ops<T: DType>() -> DTypeOps` at registration:
-  `id: DTypeId`, `device_ptr(&dyn Any) -> CUdeviceptr`, `alloc(&ExecutionContext,
-  elements) -> Result<Box<dyn Any + Send + Sync>, DeviceError>` (wrapping
-  `Tensor::<T>::uninitialized`, with the existing SAFETY argument),
-  `reshape(Box<dyn Any + Send + Sync>, &[usize]) -> Result<Arc<dyn Any + Send
-  + Sync>, Error>`. `tensor::<T>` is `downcast_ref`, `tensor_mut::<T>` is
-  `Arc::get_mut` then `downcast_mut`, `unregister::<T>` is `Arc::downcast`
-  then `Arc::into_inner`. A `Backing::Reconstruct` closure is wrapped at
-  registration into one that returns the erased tensor. This was designed
-  from the signatures in cutile 0.4 and was not compiled.
-- Not designed, because only the on-hold ARC files need them: tensors with
-  no elements and tensors of rank 0. Their behavior stays what it is today.
+`dtype` and `shape` work for a tensor in any state (resident, loading,
+spilled, dropped) and return `UnknownTensor` for an id that was never
+registered or was unregistered. `Manager::new` is not generic. Update the
+crate-level docs, which say a manager owns "device tensors", to say of any
+element type.
 
-Existing code to update: `tiermem/tests/manager.rs` and
-`tiermem/examples/overbudget.rs` (`Manager<f32>` becomes `Manager`; add a
-turbofish where inference no longer finds `T`).
+**Errors.**
 
-Tests added to `tiermem/tests/manager.rs`:
+- New `TierError::WrongDType { id: TensorId, stored: DTypeId, requested: DTypeId }`,
+  not recoverable (`is_recoverable` stays true only for the two budget
+  errors). `Display`: `tensor {id:?} holds {stored}, not {requested}` (the
+  `DTypeId` display is lowercase, like `f32`).
+- **Check order** for `tensor`, `tensor_mut` and `unregister`: first
+  `UnknownTensor`, then `WrongDType`, then (for `tensor` and `tensor_mut`)
+  `NotResident`. The type is checked in every location, so a spilled tensor
+  asked for as the wrong type is `WrongDType`, not `NotResident`. **Nothing
+  may change before the check passes:** no `finish_save`, no `finish_load`,
+  the clean host copy is kept, the entry stays registered. Compare
+  `TypeId::of::<T>()` with a `TypeId` stored in the entry's table (below),
+  not `T::DTYPE` alone, so two types that share a `DTypeId` could not be
+  mixed up; report the two `DTypeId`s.
+- `EntrySnapshot` gains `pub dtype: DTypeId`. `Snapshot`'s `Display` line
+  becomes `  {id:?} {hint:?} {dtype} {mib} {device|off-device} last_use={n}`,
+  the dtype right after the hint. No existing test matches this text.
 
-- `mixed_dtypes_share_one_budget`: budget of 8192 bytes; register a `[1024]`
-  F32 (4096) and a `[2048]` BF16 (4096); registering a `[1024]` U8 (1024)
-  evicts the least recently used one; `resident_bytes` is 5120.
-- `spill_round_trip_per_dtype`: for BF16, F32, F64, I64 and U8, register a
-  2-D tensor with distinct values, force it out, bring it back, and compare
-  contents and shape bit-exactly.
-- `wrong_dtype_is_reported`: `tensor::<f64>`, `tensor_mut::<f64>` and
-  `unregister::<f64>` on an F32 tensor return `WrongDType`; afterwards the
-  tensor is still registered, resident, and (for one that had a clean copy)
-  `clean_evictions` still counts its next eviction.
-- `dtype_and_shape_are_reported` for a resident and a spilled tensor.
-- `reconstructible_bf16_is_rebuilt`: the rebuild path with a non-F32 type.
-- `element_size_drives_eviction_count`: under one budget, admitting one F64
-  tensor of `n` elements evicts four BF16 tensors of `n` elements.
+**Element size and the budget.** A tensor's size is `tensor.num_bytes()`,
+elements times `size_of::<T>()`, which the manager already uses. The budget,
+the soft limit, the host limit and every `Stats` field stay in bytes, so a
+`[1024]` BF16 tensor counts 2048 bytes and a `[1024]` F64 tensor 8192, and
+they evict each other under the one budget. Nothing in the policy looks at
+the element type. `HostPool` and `HostBlock` are already byte-based and
+unaligned; they do not change.
 
-Benchmark (no behavior should change; this is a regression check): the three
-commands below, before the change and after, same day.
+**Internals.** These were compiled and run in a throwaway prototype on
+2026-11-16 (outside the repository): all five element types, a copy to the
+host and back through the erased types on the GPU, `downcast_ref`,
+`Arc::get_mut` then `downcast_mut`, `Arc::downcast` then `Arc::into_inner`,
+and `Box::downcast` for the reshape, all bit-exact. The manager itself was
+not changed. Anything with the same public behavior is acceptable; this is
+the shape that is known to compile:
 
-```sh
-cargo run --release -p tiermem --example overbudget -- spill --lookahead
-cargo run --release -p tiermem --example overbudget -- spill --lookahead --epochs 30
-cargo run --release -p tiermem --example overbudget -- spill --lookahead --epochs 30 --prefetch 1 --work 8
+```rust
+type Erased = dyn Any + Send + Sync;
+
+#[derive(Clone, Copy)]
+struct DTypeOps {
+    type_id: TypeId,
+    id: DTypeId,
+    elem_bytes: usize,                              // size_of::<T>()
+    device_ptr: fn(&Erased) -> CUdeviceptr,         // downcast_ref::<Tensor<T>>().device_pointer().cu_deviceptr()
+    alloc: fn(&ExecutionContext, usize) -> Result<Box<Erased>, DeviceError>,   // elements -> Tensor::<T>::uninitialized
+    reshape: fn(Box<Erased>, &[usize]) -> Result<Arc<Erased>, Error>,          // Box::downcast, Tensor::reshape, Arc::new
+}
+fn ops<T: DType>() -> DTypeOps { /* non-capturing closures coerce to the fn pointers */ }
 ```
 
-README: a short section with the before/after table (total and run medians)
-and a "what this shows" paragraph; if every difference is inside ±10%, say
-that nothing changed. Update Limitations: replace "`f32` tensors only in the
-benchmark" with what is now true (the manager holds any element type; the
-benchmark still uses F32), and update the crate table's description.
+- `Entry` stores `ops: DTypeOps`. `Location::Device` holds `Arc<Erased>`
+  that is always an `Arc<Tensor<T>>` (`Arc::new(tensor)` coerces).
+  `Entry.backing` becomes a private erased enum: `Spill`, or
+  `Reconstruct(Box<dyn Fn() -> Result<Arc<Erased>, Error>>)`, which
+  `register_with` makes by wrapping the caller's closure
+  (`move || Ok(Arc::new(f()?))`). A rebuilt tensor is not reshaped, as today.
+- `alloc` keeps the existing `SAFETY` comment (every element is initialized
+  by the copy before the submission completes). `Tensor::uninitialized(0)`
+  panics (`assert!(len > 0)`), so the existing "cannot reload an empty
+  tensor" error stays, checked before `alloc`.
+- `tensor::<T>` is `downcast_ref`. `tensor_mut::<T>` does the checks, then
+  `finish_save`, then drops the clean copy, then `Arc::get_mut(..).expect("no
+  copy holds the tensor")` and `downcast_mut`. `unregister::<T>` does the
+  checks, then the existing flow, then `Arc::downcast::<Tensor<T>>` and
+  `Arc::into_inner`. The `expect`s on a downcast cannot fire once the
+  `TypeId` check has passed.
+
+**`copy.rs`.** A copy needs no element type, only bytes. All of these lose
+their `<T>`:
+
+- `SaveToHost { keep: Arc<Erased>, src: CUdeviceptr, bytes: usize, host:
+  HostBlock }`. `execute` checks `host.bytes() == bytes`, calls
+  `ctx.retain(keep)`, and copies with `memcpy_dtoh_async::<u8>(host.as_ptr(),
+  src, bytes, ..)` (the count argument is a number of elements, so with `u8`
+  it is `bytes`), skipping the call when `bytes == 0`, as today.
+  `src` is `(ops.device_ptr)(&*keep)`, taken by the manager.
+- `LoadFromHost { host: Arc<HostBlock>, ops: DTypeOps }`, `Output =
+  Box<Erased>`: `elements = host.bytes() / ops.elem_bytes`, the empty check,
+  `tensor = (ops.alloc)(ctx, elements)?`, `dst = (ops.device_ptr)(&*tensor)`,
+  `ctx.retain(host)`, `memcpy_htod_async::<u8>(dst, src, host.bytes(), ..)`.
+- **`impl_into_future!` and the `PendingLoad`/`PendingSave` aliases lose
+  their `<T>` too.** `DeviceOp` requires `IntoFuture`, and the prototype did
+  not compile until the macro was kept for the erased ops. `Started<Op>` and
+  `Pending<Op>` stay generic over `Op`.
+- The three places that reshaped a typed tensor after a load, `reload`,
+  `start_prefetch` (the `Started::Done` case) and `finish_load`, call
+  `(entry.ops.reshape)(boxed, &entry.shape)?` instead.
+
+Not designed, because only the on-hold ARC files need them: tensors with no
+elements and tensors of rank 0. Their behavior stays what it is today.
+
+**Existing code to update.**
+
+- `tiermem/tests/manager.rs`: four `Manager<f32>` annotations (`manager`,
+  `reloaded_spill`, `big_manager`, `contents`) become `Manager`. The file has
+  9 calls of `.tensor(`, 5 of `.tensor_mut(` and 23 of `.unregister(`; add
+  `::<f32>` wherever inference no longer finds the type.
+- `tiermem/examples/overbudget.rs` has no `Manager<..>` annotation. It has
+  two calls, `mgr.tensor(id)?` (line 278) and `mgr.tensor_mut(id)?` (line
+  282), which may need `::<f32>`.
+- `tiermem/src/lib.rs`, `copy.rs`, `error.rs` as above.
+
+**Tests** added to `tiermem/tests/manager.rs`. Build every tensor with
+`api::copy_host_vec_to_device` (checked for all five element types; do not
+rely on `api::full` for BF16, I64 or U8). Element `i` of a test tensor is
+BF16 `bf16::from_f32(i as f32 * 0.37)`, F32 `i as f32 * 0.37`, F64 `i as f64
+* 0.37`, I64 `i as i64 * 1_000_003 - 7`, U8 `(i * 31 % 251) as u8`. Use
+`Policy::EvictLru` unless a test says otherwise.
+
+- `mixed_dtypes_share_one_budget`: budget 8192 bytes; register a `[1024]` F32
+  (4096) and a `[2048]` BF16 (4096), then a `[1024]` U8 (1024). The F32 (least
+  recently used) is not resident; the BF16 and the U8 are; `evictions == 1`
+  and `resident_bytes == 5120`.
+- `spill_round_trip_per_dtype`, for each of the five types: shape `[6, 7]`,
+  budget equal to one tensor's bytes. Register `a`, then a second tensor of the
+  same type and shape (which evicts `a`), then `ensure_resident(&[a])`.
+  `m.tensor::<T>(a)` read back (`to_host_vec`) equals the original values,
+  and its shape is `[6, 7]`; `stats().reloads == 1` and `bytes_to_device`
+  equals one tensor's bytes.
+- `wrong_dtype_is_reported`: budget of two `[N]` F32 tensors. Register `a`, `b`,
+  `c` (evicts `a`), `ensure_resident(&[a])` (reloads `a`, which keeps a clean
+  host copy). Then `tensor::<f64>(a)`, `tensor_mut::<f64>(a)` and
+  `unregister::<f64>(a)` each return `WrongDType { id: a, stored: F32,
+  requested: F64 }`. Afterwards `a` is still registered and resident,
+  `tensor::<f32>(a)` works, `host_bytes` is unchanged, and forcing `a` out
+  again counts one `clean_evictions` (the clean copy survived `tensor_mut`).
+  Then spill `a` and repeat `tensor::<f64>(a)` and `unregister::<f64>(a)`:
+  both are `WrongDType`, not `NotResident`, and `a` stays registered.
+- `dtype_and_shape_are_reported`: `dtype` and `shape` of a `[6, 7]` BF16
+  tensor are `BF16` and `[6, 7]` while resident, while spilled, and for an
+  unknown id `UnknownTensor`.
+- `snapshot_reports_the_dtype`: under `Policy::Strict`, a failed registration
+  returns `BudgetExceeded`, whose snapshot lists each entry with its `dtype`,
+  and whose `Display` text contains `bf16` for a BF16 entry.
+- `reconstructible_bf16_is_rebuilt`: `register_reconstructible` with a BF16
+  tensor and a closure that makes the same BF16 tensor; force it out and back:
+  `reconstructions == 1`, `bytes_to_host == 0`, `host_bytes == 0`, contents
+  equal.
+- `element_size_drives_eviction_count`: `n = 1024`, budget 8192 bytes. Four
+  `[n]` BF16 tensors fill it; registering one `[n]` F64 tensor evicts all four:
+  `evictions == 4`, `resident_bytes == 8192`.
+
+**Benchmark.** No behavior should change; this is a regression check, and
+issue #12 (the same work measured differently in different runs, 35% between
+two cases, 23% between two days) is why it is built this way: the baseline and
+the new binary run **alternately**, so that drift in the machine hits both.
+The implementer hands the user these commands (the implementer does not run
+them):
+
+```sh
+# from the repo root, on the step 6 branch with the work committed
+git worktree add ../rustile-before $(git merge-base HEAD origin/main)
+cargo build --release -p tiermem --example overbudget
+(cd ../rustile-before && cargo build --release -p tiermem --example overbudget)
+
+for round in 1 2 3; do
+  for a in "spill --lookahead" "spill --lookahead --epochs 30" \
+           "spill --lookahead --epochs 30 --prefetch 1 --work 8"; do
+    for which in before after; do
+      echo "== round $round, $which: $a"
+      if [ $which = before ]; then bin=../rustile-before/target/release/examples/overbudget
+      else bin=./target/release/examples/overbudget; fi
+      $bin $a | grep -E '^(time|  setup|  run|page-locking|peak resident|evictions|clean evictions|reloads|prefetches|reconstructions|moved|pressure events)'
+    done
+  done
+done
+git worktree remove ../rustile-before    # when done
+```
+
+The user pastes the whole output (about 200 lines). Each run is `--runs 5`
+in one process after its own warmup, so a round's `time`, `setup` and `run`
+lines are medians. What to claim:
+
+- **The counters** (`evictions`, `clean evictions`, `reloads`, `prefetches`,
+  `moved`, `reconstructions`, `pressure events`, `peak resident`) must be
+  identical before and after in every round. A difference is a behavior
+  change: stop, find it, and fix it with a test, not with a README sentence.
+- **The times:** per command, take the three per-round medians of `time`
+  and of `run` for each binary. If the before and after ranges (min to max of
+  the three medians) overlap, the README says nothing changed; if they do not
+  overlap, it reports the difference and what was checked about the cause.
+  Do not use ±10%: #12 shows two cases doing the same work differing by 35%.
+
+**README:** a short section with the before/after table (the three medians of
+`time` and `run` for each command, before and after, with the ranges) and a
+"what this shows" paragraph, mentioning that before and after were
+alternated for the reason above. Update Limitations: replace "`f32` tensors
+only in the benchmark" (README, Limitations) with what is now true (the
+manager holds any element type under one byte budget; the benchmark still
+uses F32), and update the crate table's description of `tiermem`.
 
 ### Registering from host memory (step 7)
 
@@ -824,7 +953,7 @@ and 7 do not depend on the kernels.
 | 3 | RMSNorm. | "RMSNorm" above. | `kernelbench -- rmsnorm`. README table. |
 | 4 | Embedding gather. | "Embedding gather" above. | `kernelbench -- gather`. README table; Limitations: I32 ids only, out-of-range ids give zeros, the whole table must be resident. |
 | 5 | Linear. | "Linear" above. | `kernelbench -- linear`. README table including the tile sweep; change `for_shape`'s default only as "Tile-shape rules" allows, and say which shape was kept. Limitations: F32 output for BF16 input. |
-| 6 | One manager for every element type. | "One manager for every element type" above; all existing manager tests still pass. | The three `overbudget` commands, before and after. |
+| 6 | One manager for every element type. | "One manager for every element type" above; all existing manager tests still pass. | The three `overbudget` commands, before and after, alternated over 3 rounds (see step 6). |
 | 7 | `register_host`, and `overbudget --register`. | "Registering from host memory" above. | The six `overbudget` commands. |
 | 8 | Kernels on managed tensors. | `tiermem/tests/kernels.rs`. | None. Last step: hand to review. |
 
@@ -838,7 +967,8 @@ cargo run --release -p tilekernels --example kernelbench -- <kernel> --first-cal
 
 For steps 6 and 7 the lines to paste back are `overbudget`'s `time`,
 `setup`, `run` and `page-locking` lines and its counters, for each command;
-step 6 needs them once on the commit before the change and once after.
+step 6 uses the alternating before/after loop in its own section, which prints
+exactly those lines.
 
 ## Open questions
 
@@ -883,3 +1013,18 @@ so later steps do not have to ask.
    case for the `3 × 248,320` row, which no step adds yet); until then the
    README says only that the first call's compile time grows with the row
    width.
+
+6. **Review of step 6 against the code (2026-11-16).** The spec's internals
+   had never been compiled, so a prototype of the erased pieces was compiled
+   and run on the GPU for all five element types (not committed). It found
+   that `DeviceOp` needs `IntoFuture`, so `impl_into_future!` and the
+   `PendingLoad`/`PendingSave` aliases must lose their `<T>` and be kept, and
+   that `DTypeId` is not in cutile's prelude. The review also fixed: the
+   check order of the three typed methods (`UnknownTensor`, `WrongDType`,
+   `NotResident`, with nothing changed before the check passes), the
+   snapshot line format, a wrong claim that `overbudget.rs` has
+   `Manager<f32>` annotations (only `tests/manager.rs` does), the exact test
+   setups, and the benchmark. Because of issue #12 the benchmark now
+   alternates the baseline and the new binary over 3 rounds, requires the
+   counters to match exactly, and claims "no change" when the before and
+   after ranges overlap, instead of the ±10% rule.
