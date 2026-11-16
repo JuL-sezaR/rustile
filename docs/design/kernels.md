@@ -158,7 +158,9 @@ pub enum KernelError {
 
 /// Element types the computing kernels accept, with the type they write.
 /// Sealed: implemented for bf16 (Out = f32), f32 (Out = f32), f64 (Out = f64).
-pub trait Float: DType + sealed::Sealed {
+/// The supertrait is in a module no other crate can name; it also carries the
+/// crate-private launch methods (see "Common API" below).
+pub trait Float: sealed::Launch<<Self as Float>::Out> {
     type Out: DType;
 }
 ```
@@ -185,13 +187,16 @@ kernels::softmax_f32((&mut *y).partition([bm, bn]), x)
 
 The kernels for F64 are separate, non-generic entries (`*_f64`), because the
 accumulator type and the constants differ. A wrapper picks the entry for `E`
-through a method on the sealed supertrait `sealed::Sealed`, one per computing
-kernel, as step 2 did with `launch_softmax` (decision 1 under "Open
-questions"). The trait lives in a module no other crate can name, so the
-methods are crate-private; `Float` is `pub trait Float: sealed::Sealed {}`,
-and the output type is `<E as Float>::Out`, declared on `Sealed`. Steps 3 and
-5 add `launch_rmsnorm` and `launch_linear` there. Gather needs none: it has
-one entry, generic over any `DType`.
+through a method on the sealed supertrait `sealed::Launch<O>`, one per
+computing kernel, as step 2 did with `launch_softmax` (decision 1 under "Open
+questions"). `O` is the output type. The trait lives in a module no other
+crate can name, so the methods are crate-private and no other type can
+implement `Float`; `Float` itself declares `type Out`, and requires
+`sealed::Launch<<Self as Float>::Out>`, so `<E as Float>::Out`,
+`<f32 as Float>::Out` and `E::Out` all work from another crate (a test in
+`tests/float_out.rs` compiles them from outside). Steps 3 and 5 add
+`launch_rmsnorm` and `launch_linear` there. Gather needs none: it has one
+entry, generic over any `DType`.
 
 ### Tile-shape rules (`tiles.rs`)
 
@@ -998,7 +1003,12 @@ so later steps do not have to ask.
    than the row silently normalizes each column tile on its own). The method
    and the output type now live on `sealed::Sealed`, which no other crate can
    name, and `Float` is an empty trait over it. A trait item cannot be
-   `pub(crate)` in Rust; this is the way to get the same effect.
+   `pub(crate)` in Rust; this is the way to get the same effect. **Revised
+   again (issue #15):** with `Out` on the unnameable trait, `<E as Float>::Out`
+   did not compile outside the crate, though the doc and this spec promised
+   it. Now `Float` declares `type Out` and requires the sealed
+   `Launch<<Self as Float>::Out>`, which holds the launch methods. The
+   output type is nameable everywhere and the methods stay crate-private.
 2. **`kernelbench` has its own copy of the xorshift generator, of the `Num`
    conversion trait and of the softmax tolerance,** because an example cannot
    use `tests/common`. Accepted. Do not move them into the library's public
