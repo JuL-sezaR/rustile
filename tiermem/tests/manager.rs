@@ -1438,3 +1438,80 @@ fn element_size_drives_eviction_count() {
     assert_eq!(s.evictions, 4);
     assert_eq!(s.resident_bytes, 8 * n);
 }
+
+#[test]
+fn wrong_dtype_changes_nothing_while_a_prefetch_is_in_flight() {
+    let (mut m, [a, ..]) = big_manager();
+    assert_eq!(m.prefetch(&[a]).unwrap(), 1);
+    let before = m.stats();
+    assert_eq!(before.reloads, 0, "a's reload is still in flight");
+
+    // The type is checked first, so these are WrongDType, not NotResident
+    // (a loading tensor is not resident), and nothing waits for the copy.
+    expect_wrong_dtype(m.tensor::<f64>(a), a, "tensor");
+    expect_wrong_dtype(m.tensor_mut::<f64>(a), a, "tensor_mut");
+    expect_wrong_dtype(m.unregister::<f64>(a), a, "unregister");
+
+    let after = m.stats();
+    assert_eq!(after.reloads, 0, "nothing waited for the reload");
+    assert_eq!(after.prefetches, before.prefetches);
+    assert_eq!(after.resident_bytes, before.resident_bytes);
+    assert_eq!(after.spilled_bytes, before.spilled_bytes);
+    assert_eq!(after.host_bytes, before.host_bytes);
+    assert_eq!(
+        m.dtype(a).unwrap(),
+        cutile::DTypeId::F32,
+        "still registered"
+    );
+
+    // The reload goes on and the tensor is intact.
+    assert!(contents(&mut m, a).iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn wrong_dtype_changes_nothing_while_a_write_back_is_in_flight() {
+    let mut m = Manager::new(Config::new(2 * BIG, Policy::EvictLru));
+    let a = m
+        .register(api::full(7.0f32, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+        .unwrap();
+    assert_eq!(m.write_back(&[a]).unwrap(), 1);
+    let before = m.stats();
+    assert_eq!(before.write_backs, 1);
+    assert_eq!(before.host_bytes, BIG, "the copy's host block is counted");
+
+    expect_wrong_dtype(m.tensor_mut::<f64>(a), a, "tensor_mut");
+    expect_wrong_dtype(m.unregister::<f64>(a), a, "unregister");
+
+    // A late check would wait for the copy and drop its host block, or
+    // remove the tensor.
+    let after = m.stats();
+    assert_eq!(
+        after.host_bytes, before.host_bytes,
+        "the host block is kept"
+    );
+    assert_eq!(after.write_backs, before.write_backs);
+    assert!(m.is_resident(a));
+    assert_eq!(
+        m.dtype(a).unwrap(),
+        cutile::DTypeId::F32,
+        "still registered"
+    );
+
+    // Asking for the right type is what drops the clean copy.
+    m.tensor_mut::<f32>(a).unwrap();
+    assert_eq!(m.stats().host_bytes, 0);
+}
+
+#[test]
+fn wrong_dtype_has_a_readable_message_and_is_not_recoverable() {
+    let mut m = Manager::new(Config::new(2 * BYTES, Policy::EvictLru));
+    let a = m.register(tensor(1.0), Hint::Evictable).unwrap();
+    let err = m.tensor::<f64>(a).map(|_| ()).expect_err("wrong type");
+    assert_eq!(err.to_string(), "tensor TensorId(0) holds f32, not f64");
+    assert!(!err.is_recoverable());
+    let err = m
+        .register(upload(vec![1u8; 4], &[4]), Hint::Evictable)
+        .and_then(|u8_id| m.tensor::<cutile::half::bf16>(u8_id).map(|_| ()))
+        .unwrap_err();
+    assert_eq!(err.to_string(), "tensor TensorId(1) holds u8, not bf16");
+}
