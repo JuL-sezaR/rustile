@@ -36,7 +36,7 @@ Rules for whoever implements a step:
 | 3 | Done: code, tests and README table. |
 | 4 | Done: code, tests and README table. |
 | 5 | Done: code, tests and README table. The tile sweep kept the default 64 × 64 × 32 (32 × 32 × 32 was 3% slower, 16³ and 64 × 64 × 64 about twice as slow). |
-| 6 | Code and tests done on `manager-any-dtype` (60 manager tests pass). The benchmark and README wait for the user's before/after numbers. |
+| 6 | Done: code, tests, benchmark (no change, counters identical) and README, on `manager-any-dtype`. |
 | 7 to 8 | Not started. |
 
 ## State on 2026-11-13
