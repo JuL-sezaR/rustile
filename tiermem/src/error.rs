@@ -1,4 +1,5 @@
 use crate::{Hint, TensorId};
+use cutile::DTypeId;
 use std::fmt;
 
 #[derive(Debug)]
@@ -20,6 +21,13 @@ pub enum TierError {
     },
     UnknownTensor(TensorId),
     NotResident(TensorId),
+    /// The tensor was registered with another element type than the one
+    /// asked for. Nothing was changed.
+    WrongDType {
+        id: TensorId,
+        stored: DTypeId,
+        requested: DTypeId,
+    },
     /// Not recoverable by the manager: a CUDA or cutile operation failed.
     Device(cutile::error::Error),
 }
@@ -79,6 +87,11 @@ impl fmt::Display for TierError {
                     "tensor {id:?} is not resident; call ensure_resident first"
                 )
             }
+            TierError::WrongDType {
+                id,
+                stored,
+                requested,
+            } => write!(f, "tensor {id:?} holds {stored}, not {requested}"),
             TierError::Device(e) => write!(f, "device error: {e}"),
         }
     }
@@ -98,6 +111,7 @@ pub struct Snapshot {
 pub struct EntrySnapshot {
     pub id: TensorId,
     pub hint: Hint,
+    pub dtype: DTypeId,
     pub bytes: usize,
     pub resident: bool,
     pub last_use: u64,
@@ -108,9 +122,10 @@ impl fmt::Display for Snapshot {
         for e in &self.entries {
             writeln!(
                 f,
-                "  {:?} {:?} {} {} last_use={}",
+                "  {:?} {:?} {} {} {} last_use={}",
                 e.id,
                 e.hint,
+                e.dtype,
                 mib(e.bytes),
                 if e.resident { "device" } else { "off-device" },
                 e.last_use,
