@@ -7,80 +7,91 @@
 //! pageable memory is staged by the driver before the call returns, so it can
 //! never overlap with compute.
 
+use crate::dtype::{DTypeOps, Erased};
 use crate::host::HostBlock;
 use cutile::cuda_async::device_context::with_default_device_policy;
 use cutile::cuda_async::device_future::DeviceFuture;
-use cutile::cuda_core::{Stream, memcpy_dtoh_async, memcpy_htod_async};
+use cutile::cuda_core::{Stream, memcpy_dtoh_async, memcpy_htod_async, sys};
 use cutile::prelude::*;
 use std::future::{Future, IntoFuture};
-use std::marker::PhantomData;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
-/// Copies a tensor's contents into `host`. The tensor is only read, and is
-/// kept alive until the copy has completed.
-pub(crate) struct SaveToHost<T: DType> {
-    pub tensor: Arc<Tensor<T>>,
+/// Copies a tensor's bytes into `host`. The tensor is only read, and is kept
+/// alive until the copy has completed. A copy needs no element type, only
+/// the bytes.
+pub(crate) struct SaveToHost {
+    pub keep: Arc<Erased>,
+    pub src: sys::CUdeviceptr,
+    pub bytes: usize,
     pub host: HostBlock,
 }
 
-impl<T: DType> DeviceOp for SaveToHost<T> {
+impl DeviceOp for SaveToHost {
     type Output = HostBlock;
 
     unsafe fn execute(self, ctx: &ExecutionContext) -> Result<HostBlock, DeviceError> {
-        let len = self.tensor.size();
-        if len * size_of::<T>() != self.host.bytes() {
+        if self.bytes != self.host.bytes() {
             return Err(DeviceError::Internal(
                 "host buffer and tensor differ in size".into(),
             ));
         }
-        let src = self.tensor.device_pointer().cu_deviceptr();
         // The device memory must outlive the copy; the host block is the
         // output, which the future holds until the copy has completed.
-        ctx.retain(self.tensor)?;
-        if len > 0 {
-            // SAFETY: both sides hold `len` elements and stay alive until the
+        ctx.retain(self.keep)?;
+        if self.bytes > 0 {
+            // SAFETY: both sides hold `bytes` bytes and stay alive until the
             // submission completes.
-            unsafe { memcpy_dtoh_async(self.host.as_ptr::<T>(), src, len, ctx.get_cuda_stream())? };
+            unsafe {
+                memcpy_dtoh_async(
+                    self.host.as_ptr::<u8>(),
+                    self.src,
+                    self.bytes,
+                    ctx.get_cuda_stream(),
+                )?
+            };
         }
         Ok(self.host)
     }
 }
 
-/// Allocates a 1-D device tensor and fills it from `host`.
-pub(crate) struct LoadFromHost<T: DType> {
+/// Allocates a 1-D device tensor and fills it from `host`. The output is
+/// erased; the manager gives it its shape (`DTypeOps::reshape`).
+pub(crate) struct LoadFromHost {
     pub host: Arc<HostBlock>,
-    pub dtype: PhantomData<T>,
+    pub ops: DTypeOps,
 }
 
-impl<T: DType> DeviceOp for LoadFromHost<T> {
-    type Output = Tensor<T>;
+impl DeviceOp for LoadFromHost {
+    type Output = Box<Erased>;
 
-    unsafe fn execute(self, ctx: &ExecutionContext) -> Result<Tensor<T>, DeviceError> {
-        let len = self.host.bytes() / size_of::<T>();
-        if len == 0 {
+    unsafe fn execute(self, ctx: &ExecutionContext) -> Result<Box<Erased>, DeviceError> {
+        let bytes = self.host.bytes();
+        let elements = bytes / self.ops.elem_bytes;
+        if elements == 0 {
             return Err(DeviceError::Internal(
                 "cannot reload an empty tensor".into(),
             ));
         }
-        // SAFETY: the copy enqueued below initializes every element before the
-        // submission completes, which is the earliest anyone can read it.
-        let tensor = unsafe { Tensor::<T>::uninitialized(len).execute(ctx)?.assume_init() };
-        let dst = tensor.device_pointer().cu_deviceptr();
-        let src = self.host.as_ptr::<T>().cast_const();
+        // SAFETY: the copy enqueued below writes every element of the tensor,
+        // on the same stream, before the submission completes, which is the
+        // earliest anyone can read it.
+        let tensor = unsafe { (self.ops.alloc)(ctx, elements)? };
+        let dst = (self.ops.device_ptr)(&*tensor);
+        let src = self.host.as_ptr::<u8>().cast_const();
         ctx.retain(self.host)?;
-        // SAFETY: both sides hold `len` elements; the host block is retained
+        // SAFETY: both sides hold `bytes` bytes; the host block is retained
         // by the submission and the tensor by the future's result.
-        unsafe { memcpy_htod_async(dst, src, len, ctx.get_cuda_stream())? };
+        unsafe { memcpy_htod_async(dst, src, bytes, ctx.get_cuda_stream())? };
         Ok(tensor)
     }
 }
 
 macro_rules! impl_into_future {
     ($op:ident, $out:ty) => {
-        impl<T: DType> IntoFuture for $op<T> {
+        impl IntoFuture for $op {
             type Output = Result<$out, DeviceError>;
-            type IntoFuture = DeviceFuture<$out, $op<T>>;
+            type IntoFuture = DeviceFuture<$out, $op>;
             fn into_future(self) -> Self::IntoFuture {
                 match with_default_device_policy(|policy| {
                     let stream = policy.next_stream()?;
@@ -94,15 +105,15 @@ macro_rules! impl_into_future {
     };
 }
 impl_into_future!(SaveToHost, HostBlock);
-impl_into_future!(LoadFromHost, Tensor<T>);
+impl_into_future!(LoadFromHost, Box<Erased>);
 
 /// A copy that has been submitted to a stream but not waited for.
 ///
 /// Dropping it waits for the copy and then drops the result.
 pub(crate) struct Pending<Op: DeviceOp>(DeviceFuture<<Op as DeviceOp>::Output, Op>);
 
-pub(crate) type PendingLoad<T> = Pending<LoadFromHost<T>>;
-pub(crate) type PendingSave<T> = Pending<SaveToHost<T>>;
+pub(crate) type PendingLoad = Pending<LoadFromHost>;
+pub(crate) type PendingSave = Pending<SaveToHost>;
 
 pub(crate) enum Started<Op: DeviceOp> {
     /// The copy finished before the submission returned.

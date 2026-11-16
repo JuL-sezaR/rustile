@@ -1,7 +1,7 @@
 //! Workload-aware GPU memory tiering.
 //!
-//! A [`Manager`] owns a set of registered device tensors and keeps their total
-//! size under a VRAM budget. Each tensor carries a [`Hint`] saying how costly
+//! A [`Manager`] owns a set of registered device tensors, of any element type,
+//! and keeps their total size in bytes under a VRAM budget. Each tensor carries a [`Hint`] saying how costly
 //! it is to evict. When an admission or reload would exceed the budget, the
 //! manager evicts lower-priority tensors first (spilling them to host RAM, or
 //! dropping them if they can be rebuilt) instead of failing.
@@ -20,6 +20,7 @@
 //! and with each other.
 
 mod copy;
+mod dtype;
 mod error;
 mod host;
 mod trace;
@@ -28,13 +29,15 @@ pub use error::{EntrySnapshot, Snapshot, TierError};
 pub use trace::{Event, EventKind, Trace};
 
 use copy::{LoadFromHost, PendingLoad, PendingSave, SaveToHost, Started};
+use cutile::DTypeId;
 use cutile::cuda_async::device_context::{get_default_device, with_device};
 use cutile::cuda_core::{DriverError, Stream, sys};
 use cutile::prelude::*;
+use dtype::{DTypeOps, Erased, ops};
 use host::{HostBlock, HostPool};
+use std::any::TypeId;
 use std::cmp::Reverse;
 use std::collections::{HashMap, VecDeque};
-use std::marker::PhantomData;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
@@ -66,6 +69,12 @@ pub enum Backing<T: DType> {
     Spill,
     /// Drop the contents and call this to rebuild them on reload.
     Reconstruct(Box<dyn Fn() -> Result<Tensor<T>, Error>>),
+}
+
+/// [`Backing`] with the element type erased.
+enum ErasedBacking {
+    Spill,
+    Reconstruct(Box<dyn Fn() -> Result<Arc<Erased>, Error>>),
 }
 
 /// What the manager does when room is needed.
@@ -192,22 +201,25 @@ pub struct Stats {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TensorId(u64);
 
-enum Location<T: DType> {
-    Device(Arc<Tensor<T>>),
+enum Location {
+    /// Always an `Arc<Tensor<T>>` of the entry's element type.
+    Device(Arc<Erased>),
     /// A prefetch is copying the contents back; the device memory is already
     /// allocated and counted, and `clean_copy` holds the source.
-    Loading(Box<PendingLoad<T>>),
+    Loading(Box<PendingLoad>),
     Host(Arc<HostBlock>),
     /// Evicted with [`Backing::Reconstruct`]; nothing is kept.
     Dropped,
 }
 
-struct Entry<T: DType> {
+struct Entry {
     hint: Hint,
-    backing: Backing<T>,
+    backing: ErasedBacking,
+    /// What depends on the element type, made when the tensor was registered.
+    ops: DTypeOps,
     bytes: usize,
     shape: Vec<usize>,
-    location: Location<T>,
+    location: Location,
     /// For a resident tensor reloaded from the host: the contents it was
     /// reloaded from, still valid because nothing has written to it since.
     /// Evicting it again reuses this instead of copying back to the host.
@@ -215,11 +227,11 @@ struct Entry<T: DType> {
     /// For a resident tensor without a clean copy: a copy to the host that
     /// is in flight. Once it has finished, its block becomes the clean copy.
     /// Until then the tensor can be read but not written or freed.
-    save: Option<PendingSave<T>>,
+    save: Option<PendingSave>,
     last_use: u64,
 }
 
-impl<T: DType> Entry<T> {
+impl Entry {
     fn is_resident(&self) -> bool {
         matches!(self.location, Location::Device(_))
     }
@@ -280,9 +292,9 @@ pub fn async_engine_count() -> Result<i32, TierError> {
     .map_err(dev)
 }
 
-pub struct Manager<T: DType> {
+pub struct Manager {
     config: Config,
-    entries: HashMap<TensorId, Entry<T>>,
+    entries: HashMap<TensorId, Entry>,
     next_id: u64,
     clock: u64,
     /// Declared future accesses, next first; consumed by `ensure_resident`.
@@ -302,7 +314,7 @@ pub struct Manager<T: DType> {
     trace: Trace,
 }
 
-impl<T: DType> Manager<T> {
+impl Manager {
     pub fn new(config: Config) -> Self {
         assert!(
             config.soft_limit_bytes <= config.budget_bytes,
@@ -351,13 +363,17 @@ impl<T: DType> Manager<T> {
     /// Admits a device tensor whose contents are spilled to host RAM on eviction.
     ///
     /// On failure the tensor is dropped and its device memory freed.
-    pub fn register(&mut self, tensor: Tensor<T>, hint: Hint) -> Result<TensorId, TierError> {
+    pub fn register<T: DType>(
+        &mut self,
+        tensor: Tensor<T>,
+        hint: Hint,
+    ) -> Result<TensorId, TierError> {
         self.register_with(tensor, hint, Backing::Spill)
     }
 
     /// Admits a device tensor that `rebuild` can recreate, so eviction costs
     /// no host memory or device-to-host copy.
-    pub fn register_reconstructible(
+    pub fn register_reconstructible<T: DType>(
         &mut self,
         tensor: Tensor<T>,
         hint: Hint,
@@ -366,7 +382,7 @@ impl<T: DType> Manager<T> {
         self.register_with(tensor, hint, Backing::Reconstruct(Box::new(rebuild)))
     }
 
-    pub fn register_with(
+    pub fn register_with<T: DType>(
         &mut self,
         tensor: Tensor<T>,
         hint: Hint,
@@ -381,12 +397,20 @@ impl<T: DType> Manager<T> {
         let id = TensorId(self.next_id);
         self.next_id += 1;
         let shape = tensor.shape().iter().map(|&d| d as usize).collect();
+        let backing = match backing {
+            Backing::Spill => ErasedBacking::Spill,
+            Backing::Reconstruct(rebuild) => ErasedBacking::Reconstruct(Box::new(move || {
+                let rebuilt: Arc<Erased> = Arc::new(rebuild()?);
+                Ok(rebuilt)
+            })),
+        };
         self.clock += 1;
         self.entries.insert(
             id,
             Entry {
                 hint,
                 backing,
+                ops: ops::<T>(),
                 bytes,
                 shape,
                 location: Location::Device(Arc::new(tensor)),
@@ -402,8 +426,8 @@ impl<T: DType> Manager<T> {
 
     /// Removes a tensor from management, returning it if it is on the device.
     /// Waits for a copy of it that is in flight.
-    pub fn unregister(&mut self, id: TensorId) -> Result<Option<Tensor<T>>, TierError> {
-        let entry = self.entries.get(&id).ok_or(TierError::UnknownTensor(id))?;
+    pub fn unregister<T: DType>(&mut self, id: TensorId) -> Result<Option<Tensor<T>>, TierError> {
+        let entry = self.typed_entry::<T>(id)?;
         if matches!(entry.location, Location::Loading(_)) {
             self.finish_load(id)?;
         }
@@ -416,6 +440,8 @@ impl<T: DType> Manager<T> {
         match entry.location {
             Location::Device(t) => {
                 self.sub_resident(entry.bytes);
+                let t = Arc::downcast::<Tensor<T>>(t)
+                    .unwrap_or_else(|_| unreachable!("the type was checked above"));
                 Ok(Some(Arc::into_inner(t).expect("no copy holds the tensor")))
             }
             Location::Host(_) => {
@@ -536,16 +562,45 @@ impl<T: DType> Manager<T> {
 
     /// The device tensor for `id`, which must be resident (see
     /// [`Manager::ensure_resident`]).
-    pub fn tensor(&self, id: TensorId) -> Result<&Tensor<T>, TierError> {
-        match &self
+    pub fn tensor<T: DType>(&self, id: TensorId) -> Result<&Tensor<T>, TierError> {
+        match &self.typed_entry::<T>(id)?.location {
+            Location::Device(t) => Ok(t
+                .downcast_ref::<Tensor<T>>()
+                .expect("the type was checked above")),
+            _ => Err(TierError::NotResident(id)),
+        }
+    }
+
+    /// The element type `id` was registered with, wherever its contents are.
+    pub fn dtype(&self, id: TensorId) -> Result<DTypeId, TierError> {
+        Ok(self
             .entries
             .get(&id)
             .ok_or(TierError::UnknownTensor(id))?
-            .location
-        {
-            Location::Device(t) => Ok(t.as_ref()),
-            _ => Err(TierError::NotResident(id)),
+            .ops
+            .id)
+    }
+
+    /// The shape of `id`, wherever its contents are.
+    pub fn shape(&self, id: TensorId) -> Result<&[usize], TierError> {
+        Ok(&self
+            .entries
+            .get(&id)
+            .ok_or(TierError::UnknownTensor(id))?
+            .shape)
+    }
+
+    /// The entry for `id`, if it exists and holds a `T`. Nothing is changed.
+    fn typed_entry<T: DType>(&self, id: TensorId) -> Result<&Entry, TierError> {
+        let entry = self.entries.get(&id).ok_or(TierError::UnknownTensor(id))?;
+        if entry.ops.type_id != TypeId::of::<T>() {
+            return Err(TierError::WrongDType {
+                id,
+                stored: entry.ops.id,
+                requested: T::DTYPE,
+            });
         }
+        Ok(entry)
     }
 
     /// Mutable access to the device tensor for `id`, which must be resident.
@@ -557,8 +612,8 @@ impl<T: DType> Manager<T> {
     ///
     /// Writes to a reconstructible tensor do not survive eviction: it is
     /// rebuilt from its original recipe.
-    pub fn tensor_mut(&mut self, id: TensorId) -> Result<&mut Tensor<T>, TierError> {
-        let entry = self.entries.get(&id).ok_or(TierError::UnknownTensor(id))?;
+    pub fn tensor_mut<T: DType>(&mut self, id: TensorId) -> Result<&mut Tensor<T>, TierError> {
+        let entry = self.typed_entry::<T>(id)?;
         if !entry.is_resident() {
             return Err(TierError::NotResident(id));
         }
@@ -570,7 +625,10 @@ impl<T: DType> Manager<T> {
         let Location::Device(t) = &mut entry.location else {
             unreachable!("checked above");
         };
-        Ok(Arc::get_mut(t).expect("no copy holds the tensor"))
+        Ok(Arc::get_mut(t)
+            .expect("no copy holds the tensor")
+            .downcast_mut::<Tensor<T>>()
+            .expect("the type was checked above"))
     }
 
     pub fn is_resident(&self, id: TensorId) -> bool {
@@ -597,6 +655,7 @@ impl<T: DType> Manager<T> {
             .map(|(&id, e)| EntrySnapshot {
                 id,
                 hint: e.hint,
+                dtype: e.ops.id,
                 bytes: e.bytes,
                 resident: e.on_device(),
                 last_use: e.last_use,
@@ -747,7 +806,7 @@ impl<T: DType> Manager<T> {
     fn needs_save(&self, id: TensorId) -> bool {
         let e = &self.entries[&id];
         e.is_resident()
-            && matches!(e.backing, Backing::Spill)
+            && matches!(e.backing, ErasedBacking::Spill)
             && e.clean_copy.is_none()
             && e.save.is_none()
     }
@@ -933,8 +992,15 @@ impl<T: DType> Manager<T> {
         let Location::Device(tensor) = &entry.location else {
             unreachable!("only a resident tensor is copied to the host");
         };
-        let tensor = tensor.clone();
-        match copy::start(SaveToHost { tensor, host }, &stream).map_err(dev)? {
+        let keep = tensor.clone();
+        let src = (entry.ops.device_ptr)(&*keep);
+        let save = SaveToHost {
+            keep,
+            src,
+            bytes,
+            host,
+        };
+        match copy::start(save, &stream).map_err(dev)? {
             Started::Done(host) => entry.clean_copy = Some(Arc::new(host)),
             Started::Pending(pending) => entry.save = Some(pending),
         }
@@ -988,8 +1054,8 @@ impl<T: DType> Manager<T> {
             }
             // Dropping the tensor frees the device memory.
             Location::Device(_) => match (&entry.backing, entry.clean_copy.take()) {
-                (Backing::Reconstruct(_), _) => Evicted::Dropped,
-                (Backing::Spill, Some(host)) => {
+                (ErasedBacking::Reconstruct(_), _) => Evicted::Dropped,
+                (ErasedBacking::Spill, Some(host)) => {
                     entry.location = Location::Host(host);
                     if copied {
                         Evicted::Copied
@@ -997,7 +1063,7 @@ impl<T: DType> Manager<T> {
                         Evicted::Clean
                     }
                 }
-                (Backing::Spill, None) => unreachable!("a host copy was made above"),
+                (ErasedBacking::Spill, None) => unreachable!("a host copy was made above"),
             },
             Location::Host(_) | Location::Dropped => {
                 unreachable!("only tensors on the device are eviction victims")
@@ -1037,19 +1103,21 @@ impl<T: DType> Manager<T> {
         let bytes = entry.bytes;
         let tensor = match (&entry.location, &entry.backing) {
             (Location::Device(_) | Location::Loading(_), _) => return Ok(()),
-            (Location::Host(host), _) => (LoadFromHost {
-                host: host.clone(),
-                dtype: PhantomData,
-            })
-            .sync_on(stream.as_ref().unwrap())
-            .map_err(dev)?
-            .reshape(&entry.shape)?,
-            (Location::Dropped, Backing::Reconstruct(rebuild)) => rebuild()?,
-            (Location::Dropped, Backing::Spill) => {
+            (Location::Host(host), _) => {
+                let loaded = (LoadFromHost {
+                    host: host.clone(),
+                    ops: entry.ops,
+                })
+                .sync_on(stream.as_ref().unwrap())
+                .map_err(dev)?;
+                (entry.ops.reshape)(loaded, &entry.shape)?
+            }
+            (Location::Dropped, ErasedBacking::Reconstruct(rebuild)) => rebuild()?,
+            (Location::Dropped, ErasedBacking::Spill) => {
                 unreachable!("spilled tensors are kept on the host")
             }
         };
-        let old = std::mem::replace(&mut entry.location, Location::Device(Arc::new(tensor)));
+        let old = std::mem::replace(&mut entry.location, Location::Device(tensor));
         if let Location::Host(host) = old {
             // Kept as a clean copy, so host_bytes is unchanged.
             entry.clean_copy = Some(host);
@@ -1144,11 +1212,11 @@ impl<T: DType> Manager<T> {
         let host = host.clone();
         let load = LoadFromHost {
             host: host.clone(),
-            dtype: PhantomData,
+            ops: entry.ops,
         };
         let (location, done) = match copy::start(load, &stream).map_err(dev)? {
-            Started::Done(tensor) => (
-                Location::Device(Arc::new(tensor.reshape(&entry.shape)?)),
+            Started::Done(loaded) => (
+                Location::Device((entry.ops.reshape)(loaded, &entry.shape)?),
                 true,
             ),
             Started::Pending(pending) => (Location::Loading(Box::new(pending)), false),
@@ -1181,10 +1249,10 @@ impl<T: DType> Manager<T> {
         let loaded = pending
             .wait(&stream)
             .map_err(dev)
-            .and_then(|tensor| Ok(tensor.reshape(&entry.shape)?));
+            .and_then(|loaded| Ok((entry.ops.reshape)(loaded, &entry.shape)?));
         match loaded {
             Ok(tensor) => {
-                entry.location = Location::Device(Arc::new(tensor));
+                entry.location = Location::Device(tensor);
                 self.stats.reloads += 1;
                 self.trace.span(EventKind::Reload, Some(id), bytes, start);
                 Ok(())

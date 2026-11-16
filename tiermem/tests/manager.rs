@@ -15,7 +15,7 @@ fn tensor(value: f32) -> Tensor<f32> {
 }
 
 /// Room for exactly three tensors.
-fn manager(policy: Policy) -> Manager<f32> {
+fn manager(policy: Policy) -> Manager {
     Manager::new(Config::new(3 * BYTES, policy))
 }
 
@@ -109,13 +109,13 @@ fn spill_round_trip_preserves_contents_and_shape() {
         m.register(tensor(v as f32), Hint::Evictable).unwrap();
     }
     assert!(!m.is_resident(a));
-    assert!(matches!(m.tensor(a), Err(TierError::NotResident(_))));
+    assert!(matches!(m.tensor::<f32>(a), Err(TierError::NotResident(_))));
 
     m.ensure_resident(&[a]).unwrap();
-    let t = m.tensor(a).unwrap();
+    let t = m.tensor::<f32>(a).unwrap();
     assert_eq!(t.shape(), &[32, 32]);
     let host = m
-        .unregister(a)
+        .unregister::<f32>(a)
         .unwrap()
         .unwrap()
         .to_host_vec()
@@ -141,7 +141,7 @@ fn reconstructible_tensors_are_rebuilt_not_copied() {
     assert_eq!(s.reconstructions, 1);
     assert_eq!(s.reloads, 0);
     let host = m
-        .unregister(a)
+        .unregister::<f32>(a)
         .unwrap()
         .unwrap()
         .to_host_vec()
@@ -243,7 +243,7 @@ fn lru_ignores_declared_accesses() {
 fn expect_accesses_rejects_unknown_tensors() {
     let mut m = manager(Policy::EvictLookahead);
     let a = m.register(tensor(0.0), Hint::Evictable).unwrap();
-    m.unregister(a).unwrap();
+    m.unregister::<f32>(a).unwrap();
     assert!(matches!(
         m.expect_accesses(&[a]),
         Err(TierError::UnknownTensor(_))
@@ -252,7 +252,7 @@ fn expect_accesses_rejects_unknown_tensors() {
 
 /// Registers `a` (all 7.0) and three fillers, then reloads `a`, which spills
 /// `b`. Returns `[a, b, c, d]`; `a` is resident with a clean host copy.
-fn reloaded_spill(m: &mut Manager<f32>) -> [tiermem::TensorId; 4] {
+fn reloaded_spill(m: &mut Manager) -> [tiermem::TensorId; 4] {
     let ids = [7.0, 1.0, 2.0, 3.0].map(|v| m.register(tensor(v), Hint::Evictable).unwrap());
     assert!(!m.is_resident(ids[0]));
     m.ensure_resident(&ids[..1]).unwrap();
@@ -277,7 +277,7 @@ fn clean_reeviction_skips_the_copy() {
 
     m.ensure_resident(&[a]).unwrap();
     let host = m
-        .unregister(a)
+        .unregister::<f32>(a)
         .unwrap()
         .unwrap()
         .to_host_vec()
@@ -291,7 +291,7 @@ fn tensor_mut_forces_write_back() {
     let mut m = manager(Policy::EvictLru);
     let [a, b, c, d] = reloaded_spill(&mut m);
     let host_before = m.stats().host_bytes;
-    *m.tensor_mut(a).unwrap() = tensor(9.0);
+    *m.tensor_mut::<f32>(a).unwrap() = tensor(9.0);
     assert_eq!(
         m.stats().host_bytes,
         host_before - BYTES,
@@ -308,7 +308,7 @@ fn tensor_mut_forces_write_back() {
 
     m.ensure_resident(&[a]).unwrap();
     let host = m
-        .unregister(a)
+        .unregister::<f32>(a)
         .unwrap()
         .unwrap()
         .to_host_vec()
@@ -324,7 +324,10 @@ fn tensor_mut_forces_write_back() {
 fn tensor_mut_requires_residency() {
     let mut m = manager(Policy::EvictLru);
     let [_, b, _, _] = reloaded_spill(&mut m);
-    assert!(matches!(m.tensor_mut(b), Err(TierError::NotResident(_))));
+    assert!(matches!(
+        m.tensor_mut::<f32>(b),
+        Err(TierError::NotResident(_))
+    ));
 }
 
 #[test]
@@ -334,9 +337,9 @@ fn host_bytes_tracks_spills_and_clean_copies() {
     let s = m.stats();
     assert_eq!(s.host_bytes, 2 * BYTES, "a's clean copy plus spilled b");
     assert_eq!(s.spilled_bytes, BYTES, "only b is evicted");
-    m.unregister(a).unwrap();
+    m.unregister::<f32>(a).unwrap();
     assert_eq!(m.stats().host_bytes, BYTES);
-    m.unregister(b).unwrap();
+    m.unregister::<f32>(b).unwrap();
     assert_eq!(m.stats().host_bytes, 0);
 }
 
@@ -363,7 +366,7 @@ fn pressure_stays_quiet_until_residency_falls_to_the_rearm_level() {
 
     extra.extend(ids);
     for id in extra {
-        m.unregister(id).unwrap();
+        m.unregister::<f32>(id).unwrap();
     }
     assert_eq!(m.stats().resident_bytes, 0);
     for v in 0..4 {
@@ -378,9 +381,9 @@ const BIG: usize = BIG_N * size_of::<f32>();
 
 /// Room for three big tensors; registers four, so the first (all 7.0) is
 /// spilled.
-fn big_manager() -> (Manager<f32>, [tiermem::TensorId; 4]) {
+fn big_manager() -> (Manager, [tiermem::TensorId; 4]) {
     let mut m = Manager::new(Config::new(3 * BIG, Policy::EvictLru));
-    let ids = [7.0, 1.0, 2.0, 3.0].map(|v| {
+    let ids = [7.0f32, 1.0, 2.0, 3.0].map(|v| {
         m.register(api::full(v, &[BIG_N]).sync().unwrap(), Hint::Evictable)
             .unwrap()
     });
@@ -388,9 +391,9 @@ fn big_manager() -> (Manager<f32>, [tiermem::TensorId; 4]) {
     (m, ids)
 }
 
-fn contents(m: &mut Manager<f32>, id: tiermem::TensorId) -> Vec<f32> {
+fn contents(m: &mut Manager, id: tiermem::TensorId) -> Vec<f32> {
     m.ensure_resident(&[id]).unwrap();
-    m.unregister(id)
+    m.unregister::<f32>(id)
         .unwrap()
         .unwrap()
         .to_host_vec()
@@ -416,7 +419,7 @@ fn prefetch_reloads_without_blocking_and_preserves_contents() {
 
     m.ensure_resident(&[a]).unwrap();
     assert_eq!(m.stats().reloads, 1);
-    assert_eq!(m.tensor(a).unwrap().shape(), &[N as i32]);
+    assert_eq!(m.tensor::<f32>(a).unwrap().shape(), &[N as i32]);
     assert!(contents(&mut m, a).iter().all(|&v| v == 7.0));
 }
 
@@ -447,7 +450,7 @@ fn evicting_a_prefetched_tensor_keeps_its_contents() {
     assert_eq!(s.reloads, 1, "only b; a's reload was cancelled");
     assert_eq!(s.resident_bytes, 3 * BIG);
     assert_eq!(s.spilled_bytes, BIG);
-    m.unregister(b).unwrap();
+    m.unregister::<f32>(b).unwrap();
     assert!(contents(&mut m, a).iter().all(|&v| v == 7.0));
 }
 
@@ -456,7 +459,7 @@ fn unregistering_a_prefetched_tensor_returns_it() {
     let (mut m, [a, ..]) = big_manager();
     assert_eq!(m.prefetch(&[a]).unwrap(), 1);
     let host = m
-        .unregister(a)
+        .unregister::<f32>(a)
         .unwrap()
         .expect("on the device")
         .to_host_vec()
@@ -483,7 +486,7 @@ fn automatic_prefetch_follows_the_declared_order() {
     for _ in 0..3 {
         for (v, &id) in ids.iter().enumerate() {
             m.ensure_resident(&[id]).unwrap();
-            let host = m.tensor(id).unwrap().dup().sync().unwrap();
+            let host = m.tensor::<f32>(id).unwrap().dup().sync().unwrap();
             let host = host.to_host_vec().sync().unwrap();
             assert!(host.iter().all(|&x| x == v as f32));
         }
@@ -544,7 +547,7 @@ fn host_limit_frees_clean_copies_before_failing() {
     assert!(matches!(err, TierError::HostBudgetExceeded { .. }), "{err}");
     assert!(err.is_recoverable());
     assert_eq!(m.stats().resident_bytes, 3 * BYTES, "nothing was evicted");
-    m.unregister(e).unwrap();
+    m.unregister::<f32>(e).unwrap();
     for (id, v) in [(a, 7.0), (b, 1.0), (c, 2.0), (d, 3.0)] {
         assert!(contents(&mut m, id).iter().all(|&x| x == v), "tensor {v}");
     }
@@ -556,7 +559,7 @@ fn waiting_for_an_in_flight_prefetch_yields_the_contents() {
     m.ensure_resident(&[c, d]).unwrap();
     assert_eq!(m.prefetch(&[a]).unwrap(), 1);
     assert!(!m.is_resident(a), "not resident until waited for");
-    assert!(matches!(m.tensor(a), Err(TierError::NotResident(_))));
+    assert!(matches!(m.tensor::<f32>(a), Err(TierError::NotResident(_))));
     assert!(
         m.is_resident(c) && m.is_resident(d),
         "tensors in use are spared"
@@ -579,7 +582,7 @@ fn lazy_pins_on_first_spill_and_reuses_freed_blocks() {
     assert!(s.pin_time > Duration::ZERO);
 
     // Writing to a gives up its clean copy; the block stays page-locked.
-    *m.tensor_mut(a).unwrap() = tensor(9.0);
+    *m.tensor_mut::<f32>(a).unwrap() = tensor(9.0);
     assert_eq!(m.stats().host_bytes, BYTES);
     assert_eq!(m.stats().pinned_bytes, 2 * BYTES);
 
@@ -614,7 +617,7 @@ fn eager_arena_is_pinned_once_at_the_first_registration() {
     assert!(!m.is_resident(first));
     for (id, v) in [(first, 7.0), (rest[0], 1.0), (rest[1], 2.0), (rest[2], 3.0)] {
         m.ensure_resident(&[id]).unwrap();
-        let host = m.tensor(id).unwrap().dup().sync().unwrap();
+        let host = m.tensor::<f32>(id).unwrap().dup().sync().unwrap();
         assert!(host.to_host_vec().sync().unwrap().iter().all(|&x| x == v));
     }
     let s = m.stats();
@@ -646,7 +649,7 @@ fn eager_arena_is_the_host_limit() {
     let err = m.register(tensor(9.0), Hint::Evictable).unwrap_err();
     assert!(matches!(err, TierError::HostBudgetExceeded { .. }), "{err}");
     assert_eq!(m.stats().pinned_bytes, 2 * BYTES, "the arena never grows");
-    m.unregister(e).unwrap();
+    m.unregister::<f32>(e).unwrap();
     for (id, v) in [(a, 7.0), (b, 1.0), (c, 2.0), (d, 3.0)] {
         assert!(contents(&mut m, id).iter().all(|&x| x == v), "tensor {v}");
     }
@@ -655,7 +658,7 @@ fn eager_arena_is_the_host_limit() {
 #[test]
 #[should_panic(expected = "host limit")]
 fn eager_allocation_needs_a_host_limit() {
-    let _ = Manager::<f32>::new(Config {
+    let _ = Manager::new(Config {
         host_alloc: HostAlloc::Eager,
         ..Config::new(3 * BYTES, Policy::EvictLru)
     });
@@ -672,7 +675,7 @@ fn lazy_unpins_unused_blocks_when_the_host_limit_needs_the_room() {
     assert!(!m.is_resident(s1));
     // s1's block stays page-locked but unused; it is too small for `big`.
     for id in [s1, s2, s3] {
-        m.unregister(id).unwrap();
+        m.unregister::<f32>(id).unwrap();
     }
     assert_eq!(m.stats().pinned_bytes, BYTES);
     let big = m
@@ -685,7 +688,7 @@ fn lazy_unpins_unused_blocks_when_the_host_limit_needs_the_room() {
     assert_eq!(s.host_bytes, 2 * BYTES);
     assert_eq!(s.pinned_bytes, 2 * BYTES, "the unused block was unpinned");
     // Reloading big must not need to spill anything: the host is full.
-    m.unregister(last).unwrap();
+    m.unregister::<f32>(last).unwrap();
     assert!(contents(&mut m, big).iter().all(|&v| v == 5.0));
 }
 
@@ -729,14 +732,14 @@ fn a_tensor_being_written_back_stays_resident_and_readable() {
         BIG,
         "the device memory is still held"
     );
-    let copy = m.tensor(a).unwrap().dup().sync().unwrap();
+    let copy = m.tensor::<f32>(a).unwrap().dup().sync().unwrap();
     assert!(copy.to_host_vec().sync().unwrap().iter().all(|&v| v == 7.0));
 }
 
 #[test]
 fn evicting_during_a_write_back_waits_for_the_copy() {
     let mut m = Manager::new(Config::new(3 * BIG, Policy::EvictLru));
-    let [a, _, _] = [7.0, 1.0, 2.0].map(|v| {
+    let [a, _, _] = [7.0f32, 1.0, 2.0].map(|v| {
         m.register(api::full(v, &[BIG_N]).sync().unwrap(), Hint::Evictable)
             .unwrap()
     });
@@ -753,12 +756,12 @@ fn evicting_during_a_write_back_waits_for_the_copy() {
 #[test]
 fn writing_during_a_write_back_discards_the_stale_copy() {
     let mut m = Manager::new(Config::new(3 * BIG, Policy::EvictLru));
-    let [a, _, _] = [7.0, 1.0, 2.0].map(|v| {
+    let [a, _, _] = [7.0f32, 1.0, 2.0].map(|v| {
         m.register(api::full(v, &[BIG_N]).sync().unwrap(), Hint::Evictable)
             .unwrap()
     });
     assert_eq!(m.write_back(&[a]).unwrap(), 1);
-    *m.tensor_mut(a).unwrap() = api::full(9.0f32, &[BIG_N]).sync().unwrap();
+    *m.tensor_mut::<f32>(a).unwrap() = api::full(9.0f32, &[BIG_N]).sync().unwrap();
     assert_eq!(
         m.stats().host_bytes,
         0,
@@ -780,7 +783,7 @@ fn unregistering_during_a_write_back_returns_the_tensor() {
         .unwrap();
     assert_eq!(m.write_back(&[a]).unwrap(), 1);
     let host = m
-        .unregister(a)
+        .unregister::<f32>(a)
         .unwrap()
         .expect("on the device")
         .to_host_vec()
@@ -808,7 +811,7 @@ fn write_back_skips_tensors_with_nothing_to_copy() {
         "a is clean, b is on the host, and the third is rebuilt, not copied"
     );
     assert_eq!(m.stats().bytes_to_host, before);
-    m.unregister(a).unwrap();
+    m.unregister::<f32>(a).unwrap();
     assert!(matches!(
         m.write_back(&[a]),
         Err(TierError::UnknownTensor(_))
@@ -867,14 +870,15 @@ fn dirty_sweep(copy_streams: usize) -> tiermem::Stats {
     for epoch in 0..EPOCHS {
         for (v, &id) in ids.iter().enumerate() {
             m.ensure_resident(&[id]).unwrap();
-            let seen = m.tensor(id).unwrap().dup().sync().unwrap();
+            let seen = m.tensor::<f32>(id).unwrap().dup().sync().unwrap();
             let seen = seen.to_host_vec().sync().unwrap();
             let expected = (100 * epoch + v) as f32;
             assert!(
                 seen.iter().all(|&x| x == expected),
                 "epoch {epoch} tensor {v}"
             );
-            *m.tensor_mut(id).unwrap() = api::full(expected + 100.0, &[BIG_N]).sync().unwrap();
+            *m.tensor_mut::<f32>(id).unwrap() =
+                api::full(expected + 100.0, &[BIG_N]).sync().unwrap();
         }
     }
     let s = m.stats();
@@ -902,7 +906,7 @@ fn written_tensors_survive_write_behind_and_prefetch_on_one_stream() {
 #[test]
 #[should_panic(expected = "copy streams")]
 fn a_manager_has_one_or_two_copy_streams() {
-    let _ = Manager::<f32>::new(Config {
+    let _ = Manager::new(Config {
         copy_streams: 3,
         ..Config::new(3 * BYTES, Policy::EvictLru)
     });
@@ -931,7 +935,7 @@ fn automatic_prefetch_works_under_a_host_limit_that_works_without_it() {
             for (v, &id) in ids.iter().enumerate() {
                 m.ensure_resident(&[id])
                     .unwrap_or_else(|e| panic!("depth {depth} round {round} tensor {v}: {e}"));
-                let seen = m.tensor(id).unwrap().dup().sync().unwrap();
+                let seen = m.tensor::<f32>(id).unwrap().dup().sync().unwrap();
                 assert!(
                     seen.to_host_vec()
                         .sync()
@@ -952,7 +956,7 @@ fn eviction_reclaims_a_write_back(settle: bool) {
         host_limit_bytes: BIG,
         ..Config::new(2 * BIG, Policy::EvictLru)
     });
-    let [a, b] = [1.0, 2.0].map(|v| {
+    let [a, b] = [1.0f32, 2.0].map(|v| {
         m.register(api::full(v, &[BIG_N]).sync().unwrap(), Hint::Evictable)
             .unwrap()
     });
@@ -969,7 +973,7 @@ fn eviction_reclaims_a_write_back(settle: bool) {
         BIG,
         "only a's contents are on the host"
     );
-    m.unregister(c).unwrap();
+    m.unregister::<f32>(c).unwrap();
     assert!(contents(&mut m, a).iter().all(|&v| v == 1.0));
     assert!(contents(&mut m, b).iter().all(|&v| v == 2.0));
 }
@@ -1021,7 +1025,7 @@ fn the_eager_arena_serves_a_spill_that_fits_in_its_free_bytes() {
     // The first four are spilled, in arena order. Freeing the first and the
     // third leaves two holes of one unit each.
     for &id in &[ids[0], ids[2], ids[4], ids[5]] {
-        m.unregister(id).unwrap();
+        m.unregister::<f32>(id).unwrap();
     }
     assert_eq!(m.stats().host_bytes, 2 * BYTES);
     let big = m.register(sized(9.0, 2), Hint::Evictable).unwrap();
@@ -1031,7 +1035,7 @@ fn the_eager_arena_serves_a_spill_that_fits_in_its_free_bytes() {
     let s = m.stats();
     assert_eq!(s.host_bytes, 4 * BYTES);
     assert_eq!(s.pinned_bytes, 4 * BYTES);
-    m.unregister(last).unwrap();
+    m.unregister::<f32>(last).unwrap();
     assert!(contents(&mut m, big).iter().all(|&v| v == 9.0));
     assert!(
         contents(&mut m, ids[1]).iter().all(|&v| v == 1.0),
@@ -1050,7 +1054,7 @@ fn lazy_blocks_of_one_size_do_not_strand_room_for_another() {
     let twos = [1.0, 2.0, 3.0].map(|v| m.register(sized(v, 2), Hint::Evictable).unwrap());
     assert_eq!(m.stats().pinned_bytes, 4 * BYTES);
     for id in twos {
-        m.unregister(id).unwrap();
+        m.unregister::<f32>(id).unwrap();
     }
     let ones: Vec<_> = (0..5)
         .map(|v| {
@@ -1060,7 +1064,7 @@ fn lazy_blocks_of_one_size_do_not_strand_room_for_another() {
         .collect();
     assert!(!m.is_resident(ones[0]) && !m.is_resident(ones[1]) && !m.is_resident(ones[2]));
     for &id in &[ones[1], ones[3], ones[4]] {
-        m.unregister(id).unwrap();
+        m.unregister::<f32>(id).unwrap();
     }
     assert_eq!(m.stats().host_bytes, 2 * BYTES);
     let big = m.register(sized(9.0, 2), Hint::Evictable).unwrap();
@@ -1068,7 +1072,7 @@ fn lazy_blocks_of_one_size_do_not_strand_room_for_another() {
     let last = m.register(sized(7.0, 1), Hint::Evictable).unwrap();
     assert!(!m.is_resident(big));
     assert!(m.stats().pinned_bytes <= 4 * BYTES);
-    m.unregister(last).unwrap();
+    m.unregister::<f32>(last).unwrap();
     assert!(contents(&mut m, big).iter().all(|&v| v == 9.0));
     assert!(contents(&mut m, ones[0]).iter().all(|&v| v == 10.0));
     assert!(contents(&mut m, ones[2]).iter().all(|&v| v == 12.0));
@@ -1152,7 +1156,7 @@ fn automatic_prefetch_does_not_cancel_a_reload_in_flight() {
         prefetch_depth: 1,
         ..Config::new(3 * BIG, Policy::EvictLookahead)
     });
-    let [a, b, _c, d] = [7.0, 1.0, 2.0, 3.0].map(|v| {
+    let [a, b, _c, d] = [7.0f32, 1.0, 2.0, 3.0].map(|v| {
         m.register(api::full(v, &[BIG_N]).sync().unwrap(), Hint::Evictable)
             .unwrap()
     });
@@ -1192,4 +1196,322 @@ fn write_back_returns_before_the_copy_has_finished() {
         "write_back took {submitted:?}; an eviction that waits for the same copy took {waited:?}"
     );
     let _ = c;
+}
+
+// ---- element types: one manager, one byte budget
+
+/// Element `i` of a test tensor, for each element type.
+trait Sample: DType + PartialEq {
+    fn sample(i: usize) -> Self;
+}
+
+impl Sample for cutile::half::bf16 {
+    fn sample(i: usize) -> Self {
+        cutile::half::bf16::from_f32(i as f32 * 0.37)
+    }
+}
+
+impl Sample for f32 {
+    fn sample(i: usize) -> Self {
+        i as f32 * 0.37
+    }
+}
+
+impl Sample for f64 {
+    fn sample(i: usize) -> Self {
+        i as f64 * 0.37
+    }
+}
+
+impl Sample for i64 {
+    fn sample(i: usize) -> Self {
+        i as i64 * 1_000_003 - 7
+    }
+}
+
+impl Sample for u8 {
+    fn sample(i: usize) -> Self {
+        (i * 31 % 251) as u8
+    }
+}
+
+/// A device tensor of `shape` holding `values`. Built from a host vector,
+/// which works for every element type (`api::full` does not for all).
+fn upload<T: DType>(values: Vec<T>, shape: &[usize]) -> Tensor<T> {
+    api::copy_host_vec_to_device(&Arc::new(values))
+        .sync()
+        .unwrap()
+        .reshape(shape)
+        .unwrap()
+}
+
+/// A tensor of `shape` filled with the samples of `T`, and its values.
+fn sampled<T: Sample>(shape: &[usize]) -> (Tensor<T>, Vec<T>) {
+    let values: Vec<T> = (0..shape.iter().product()).map(T::sample).collect();
+    (upload(values.clone(), shape), values)
+}
+
+fn read_back<T: DType>(m: &Manager, id: tiermem::TensorId) -> Vec<T> {
+    m.tensor::<T>(id)
+        .unwrap()
+        .dup()
+        .to_host_vec()
+        .sync()
+        .unwrap()
+}
+
+#[test]
+fn mixed_dtypes_share_one_budget() {
+    use cutile::half::bf16;
+    let mut m = Manager::new(Config::new(8192, Policy::EvictLru));
+    let f = m
+        .register(upload(vec![1.0f32; 1024], &[1024]), Hint::Evictable)
+        .unwrap(); // 4096 bytes
+    let b = m
+        .register(
+            upload(vec![bf16::from_f32(1.0); 2048], &[2048]),
+            Hint::Evictable,
+        )
+        .unwrap(); // 4096 bytes
+    let u = m
+        .register(upload(vec![1u8; 1024], &[1024]), Hint::Evictable)
+        .unwrap(); // 1024 bytes
+    assert!(!m.is_resident(f), "the least recently used goes");
+    assert!(m.is_resident(b));
+    assert!(m.is_resident(u));
+    let s = m.stats();
+    assert_eq!(s.evictions, 1);
+    assert_eq!(s.resident_bytes, 5120);
+}
+
+fn spill_round_trip<T: Sample>() {
+    let shape = [6, 7];
+    let (t, values) = sampled::<T>(&shape);
+    let bytes = t.num_bytes();
+    let mut m = Manager::new(Config::new(bytes, Policy::EvictLru));
+    let a = m.register(t, Hint::Evictable).unwrap();
+    m.register(sampled::<T>(&shape).0, Hint::Evictable).unwrap(); // evicts a
+    assert!(!m.is_resident(a));
+    m.ensure_resident(&[a]).unwrap();
+    assert_eq!(m.tensor::<T>(a).unwrap().shape(), &[6, 7]);
+    assert_eq!(read_back::<T>(&m, a), values, "{:?}", T::DTYPE);
+    let s = m.stats();
+    assert_eq!(s.reloads, 1);
+    assert_eq!(s.bytes_to_device, bytes as u64);
+}
+
+#[test]
+fn spill_round_trip_per_dtype() {
+    spill_round_trip::<cutile::half::bf16>();
+    spill_round_trip::<f32>();
+    spill_round_trip::<f64>();
+    spill_round_trip::<i64>();
+    spill_round_trip::<u8>();
+}
+
+fn expect_wrong_dtype<T>(result: Result<T, TierError>, id: tiermem::TensorId, what: &str) {
+    match result.map(|_| ()) {
+        Err(TierError::WrongDType {
+            id: got,
+            stored,
+            requested,
+        }) => {
+            assert_eq!(got, id, "{what}");
+            assert_eq!(stored, cutile::DTypeId::F32, "{what}");
+            assert_eq!(requested, cutile::DTypeId::F64, "{what}");
+        }
+        other => panic!("{what}: expected WrongDType, got {other:?}"),
+    }
+}
+
+#[test]
+fn wrong_dtype_is_reported() {
+    let mut m = Manager::new(Config::new(2 * BYTES, Policy::EvictLru));
+    let a = m.register(tensor(1.0), Hint::Evictable).unwrap();
+    let b = m.register(tensor(2.0), Hint::Evictable).unwrap();
+    let c = m.register(tensor(3.0), Hint::Evictable).unwrap(); // evicts a
+    m.ensure_resident(&[a]).unwrap(); // reloads a, which keeps a clean host copy
+    let _ = b;
+    assert_eq!(m.stats().clean_evictions, 0);
+    let host_bytes = m.stats().host_bytes;
+
+    expect_wrong_dtype(m.tensor::<f64>(a), a, "tensor");
+    expect_wrong_dtype(m.tensor_mut::<f64>(a), a, "tensor_mut");
+    expect_wrong_dtype(m.unregister::<f64>(a), a, "unregister");
+    assert!(m.is_resident(a));
+    assert!(m.tensor::<f32>(a).is_ok());
+    assert_eq!(m.stats().host_bytes, host_bytes, "the clean copy was kept");
+
+    // Make `a` the least recently used and push it out: its clean copy must
+    // have survived the failed `tensor_mut`, so the eviction copies nothing.
+    m.ensure_resident(&[c]).unwrap();
+    m.register(tensor(4.0), Hint::Evictable).unwrap();
+    assert!(!m.is_resident(a));
+    assert_eq!(m.stats().clean_evictions, 1);
+
+    // Spilled: the type is still checked first, and the tensor stays.
+    expect_wrong_dtype(m.tensor::<f64>(a), a, "tensor, spilled");
+    expect_wrong_dtype(m.unregister::<f64>(a), a, "unregister, spilled");
+    assert_eq!(m.dtype(a).unwrap(), cutile::DTypeId::F32);
+    assert!(matches!(m.tensor::<f32>(a), Err(TierError::NotResident(_))));
+}
+
+#[test]
+fn dtype_and_shape_are_reported() {
+    use cutile::DTypeId;
+    use cutile::half::bf16;
+    let shape = [6, 7];
+    let (t, _) = sampled::<bf16>(&shape);
+    let mut m = Manager::new(Config::new(t.num_bytes(), Policy::EvictLru));
+    let a = m.register(t, Hint::Evictable).unwrap();
+    assert_eq!(m.dtype(a).unwrap(), DTypeId::BF16);
+    assert_eq!(m.shape(a).unwrap(), &[6, 7]);
+    m.register(sampled::<bf16>(&shape).0, Hint::Evictable)
+        .unwrap();
+    assert!(!m.is_resident(a));
+    assert_eq!(m.dtype(a).unwrap(), DTypeId::BF16, "spilled");
+    assert_eq!(m.shape(a).unwrap(), &[6, 7], "spilled");
+    m.unregister::<bf16>(a).unwrap();
+    assert!(matches!(m.dtype(a), Err(TierError::UnknownTensor(_))));
+    assert!(matches!(m.shape(a), Err(TierError::UnknownTensor(_))));
+}
+
+#[test]
+fn snapshot_reports_the_dtype() {
+    use cutile::DTypeId;
+    use cutile::half::bf16;
+    let mut m = Manager::new(Config::new(64, Policy::Strict));
+    m.register(
+        upload(vec![bf16::from_f32(1.0); 16], &[16]),
+        Hint::Evictable,
+    )
+    .unwrap(); // 32 bytes
+    m.register(upload(vec![1.0f32; 8], &[8]), Hint::Evictable)
+        .unwrap(); // 32 bytes
+    let err = m
+        .register(upload(vec![1u8; 1], &[1]), Hint::Evictable)
+        .unwrap_err();
+    let TierError::BudgetExceeded { snapshot, .. } = &err else {
+        panic!("expected BudgetExceeded, got {err}");
+    };
+    let dtypes: Vec<DTypeId> = snapshot.entries.iter().map(|e| e.dtype).collect();
+    assert_eq!(dtypes, [DTypeId::BF16, DTypeId::F32]);
+    let text = err.to_string();
+    assert!(text.contains("bf16") && text.contains("f32"), "{text}");
+}
+
+#[test]
+fn reconstructible_bf16_is_rebuilt() {
+    use cutile::half::bf16;
+    let shape = [6usize, 7];
+    let (t, values) = sampled::<bf16>(&shape);
+    let mut m = Manager::new(Config::new(t.num_bytes(), Policy::EvictLru));
+    let rebuild = |values: Vec<bf16>| move || Ok(upload(values.clone(), &[6, 7]));
+    let a = m
+        .register_reconstructible(t, Hint::Evictable, rebuild(values.clone()))
+        .unwrap();
+    let (other, other_values) = sampled::<bf16>(&shape);
+    m.register_reconstructible(other, Hint::Evictable, rebuild(other_values))
+        .unwrap(); // evicts a, which is dropped
+    assert!(!m.is_resident(a));
+    m.ensure_resident(&[a]).unwrap();
+    let s = m.stats();
+    assert_eq!(s.reconstructions, 1);
+    assert_eq!(s.bytes_to_host, 0);
+    assert_eq!(s.host_bytes, 0);
+    assert_eq!(read_back::<bf16>(&m, a), values);
+}
+
+#[test]
+fn element_size_drives_eviction_count() {
+    use cutile::half::bf16;
+    let n = 1024;
+    let mut m = Manager::new(Config::new(8 * n, Policy::EvictLru));
+    for _ in 0..4 {
+        m.register(upload(vec![bf16::from_f32(1.0); n], &[n]), Hint::Evictable)
+            .unwrap(); // 2 * n bytes each
+    }
+    assert_eq!(m.stats().evictions, 0);
+    m.register(upload(vec![1.0f64; n], &[n]), Hint::Evictable)
+        .unwrap(); // 8 * n bytes
+    let s = m.stats();
+    assert_eq!(s.evictions, 4);
+    assert_eq!(s.resident_bytes, 8 * n);
+}
+
+#[test]
+fn wrong_dtype_changes_nothing_while_a_prefetch_is_in_flight() {
+    let (mut m, [a, ..]) = big_manager();
+    assert_eq!(m.prefetch(&[a]).unwrap(), 1);
+    let before = m.stats();
+    assert_eq!(before.reloads, 0, "a's reload is still in flight");
+
+    // The type is checked first, so these are WrongDType, not NotResident
+    // (a loading tensor is not resident), and nothing waits for the copy.
+    expect_wrong_dtype(m.tensor::<f64>(a), a, "tensor");
+    expect_wrong_dtype(m.tensor_mut::<f64>(a), a, "tensor_mut");
+    expect_wrong_dtype(m.unregister::<f64>(a), a, "unregister");
+
+    let after = m.stats();
+    assert_eq!(after.reloads, 0, "nothing waited for the reload");
+    assert_eq!(after.prefetches, before.prefetches);
+    assert_eq!(after.resident_bytes, before.resident_bytes);
+    assert_eq!(after.spilled_bytes, before.spilled_bytes);
+    assert_eq!(after.host_bytes, before.host_bytes);
+    assert_eq!(
+        m.dtype(a).unwrap(),
+        cutile::DTypeId::F32,
+        "still registered"
+    );
+
+    // The reload goes on and the tensor is intact.
+    assert!(contents(&mut m, a).iter().all(|&v| v == 7.0));
+}
+
+#[test]
+fn wrong_dtype_changes_nothing_while_a_write_back_is_in_flight() {
+    let mut m = Manager::new(Config::new(2 * BIG, Policy::EvictLru));
+    let a = m
+        .register(api::full(7.0f32, &[BIG_N]).sync().unwrap(), Hint::Evictable)
+        .unwrap();
+    assert_eq!(m.write_back(&[a]).unwrap(), 1);
+    let before = m.stats();
+    assert_eq!(before.write_backs, 1);
+    assert_eq!(before.host_bytes, BIG, "the copy's host block is counted");
+
+    expect_wrong_dtype(m.tensor_mut::<f64>(a), a, "tensor_mut");
+    expect_wrong_dtype(m.unregister::<f64>(a), a, "unregister");
+
+    // A late check would wait for the copy and drop its host block, or
+    // remove the tensor.
+    let after = m.stats();
+    assert_eq!(
+        after.host_bytes, before.host_bytes,
+        "the host block is kept"
+    );
+    assert_eq!(after.write_backs, before.write_backs);
+    assert!(m.is_resident(a));
+    assert_eq!(
+        m.dtype(a).unwrap(),
+        cutile::DTypeId::F32,
+        "still registered"
+    );
+
+    // Asking for the right type is what drops the clean copy.
+    m.tensor_mut::<f32>(a).unwrap();
+    assert_eq!(m.stats().host_bytes, 0);
+}
+
+#[test]
+fn wrong_dtype_has_a_readable_message_and_is_not_recoverable() {
+    let mut m = Manager::new(Config::new(2 * BYTES, Policy::EvictLru));
+    let a = m.register(tensor(1.0), Hint::Evictable).unwrap();
+    let err = m.tensor::<f64>(a).map(|_| ()).expect_err("wrong type");
+    assert_eq!(err.to_string(), "tensor TensorId(0) holds f32, not f64");
+    assert!(!err.is_recoverable());
+    let err = m
+        .register(upload(vec![1u8; 4], &[4]), Hint::Evictable)
+        .and_then(|u8_id| m.tensor::<cutile::half::bf16>(u8_id).map(|_| ()))
+        .unwrap_err();
+    assert_eq!(err.to_string(), "tensor TensorId(1) holds u8, not bf16");
 }

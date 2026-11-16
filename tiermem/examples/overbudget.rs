@@ -223,7 +223,7 @@ fn run_once(args: &Args, write_trace: bool) -> Result<Outcome, Box<dyn std::erro
         Mode::Spill | Mode::Rebuild if args.lookahead => Policy::EvictLookahead,
         Mode::Spill | Mode::Rebuild => Policy::EvictLru,
     };
-    let mut mgr = Manager::<f32>::new(Config {
+    let mut mgr = Manager::new(Config {
         prefetch_depth: args.prefetch,
         host_limit_bytes: args.host_limit_mib.map_or(usize::MAX, |mib| mib * MIB),
         host_alloc: args.host_alloc,
@@ -275,11 +275,12 @@ fn run_once(args: &Args, write_trace: bool) -> Result<Outcome, Box<dyn std::erro
             for &id in &layers {
                 mgr.ensure_resident(&[id])?;
                 for _ in 0..args.work {
-                    kernel::add((&mut out).partition([TILE]), &acc, mgr.tensor(id)?).sync()?;
+                    kernel::add((&mut out).partition([TILE]), &acc, mgr.tensor::<f32>(id)?)
+                        .sync()?;
                     std::mem::swap(&mut acc, &mut out);
                 }
                 if args.dirty {
-                    mgr.tensor_mut(id)?;
+                    mgr.tensor_mut::<f32>(id)?;
                 }
             }
         }

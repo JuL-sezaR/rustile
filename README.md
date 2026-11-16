@@ -21,7 +21,7 @@ the design for the tile kernels and the manager changes they need is in
 
 | Crate | What it is |
 |---|---|
-| [`tiermem`](tiermem/) | VRAM budget manager: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
+| [`tiermem`](tiermem/) | VRAM budget manager for tensors of any element type: residency hints, eviction (spill to pinned host RAM or rebuild), lookahead eviction, prefetch and asynchronous write-back on copy streams of its own, a pool of page-locked host memory (locked as needed or up front) with a limit, soft-limit pressure callbacks with hysteresis, recoverable budget errors with a diagnostic snapshot, Chrome-trace timeline. |
 | [`tilekernels`](tilekernels/) | Tile kernels on cuTile Rust, each tested against a CPU reference: softmax, RMSNorm, embedding gather and a linear layer. |
 | [`vecadd`](vecadd/) | The original cuTile hello-world: a single tile kernel adding two vectors. |
 
@@ -394,6 +394,49 @@ which carries 31.5 GB/s before protocol overhead. So there is at most about
 copies (fewer misses, clean copies) or hiding them behind compute (prefetch,
 write-back).
 
+## One manager for every element type
+
+`Manager` used to be generic over one element type, so a model whose files
+hold BF16, F32, F64, I64 and U8 tensors could not share one budget. Now
+`register`, `tensor`, `tensor_mut` and `unregister` take the element type as
+a parameter, and `Manager::dtype(id)` and `Manager::shape(id)` report what a
+tensor is, wherever its contents are. Sizes, the budget, the host limit and
+every `Stats` field are in bytes, so a `[1024]` BF16 tensor counts 2048 bytes
+and a `[1024]` F64 tensor 8192, and they evict each other like any other
+tensors. Copies between the device and host memory move bytes and need no
+element type.
+
+For read-only `f32` layers under `spill --lookahead`, which is what was
+measured, this changed nothing. The previous commit and this one were run
+alternately, 3 rounds of each command (each run `--runs 5` in one process
+after its own warmup), because the benchmark varies between sessions and
+between cases (issue #12). RTX 5080 Laptop, WSL2, 2026-11-16. Each cell is
+the range of the three per-round medians.
+
+| Command | Time, before | Time, after | Run, before | Run, after |
+|---|---|---|---|---|
+| `spill --lookahead` | 0.367 to 0.374 s | 0.359 to 0.386 s | 0.144 to 0.148 s | 0.142 to 0.155 s |
+| `... --epochs 30` | 1.055 to 1.071 s | 1.049 to 1.102 s | 0.838 to 0.848 s | 0.835 to 0.865 s |
+| `... --epochs 30 --prefetch 1 --work 8` | 1.309 to 1.367 s | 1.290 to 1.360 s | 1.083 to 1.147 s | 1.065 to 1.136 s |
+
+What this shows:
+
+- **Nothing changed in these three commands.** The before and after ranges
+  overlap in every cell.
+- **Their counters are identical in all nine pairs**: evictions, clean
+  evictions, reloads, prefetches, bytes moved, peak resident and pressure
+  events (for example 35 evictions, 27 reloads and 2432 MiB moved for the
+  first command). In these runs the change did not alter what the manager
+  decides, only how it stores the tensors.
+- **Not benchmarked:** copying a modified tensor back (`--dirty`), `rebuild`
+  mode, a host limit, eager allocation and the LRU policy all go through code
+  that changed. The tests check that they still give the right contents and
+  counters; their speed was not measured.
+- A mistake that the compiler no longer catches: with `Manager<f32>` gone,
+  a bare float literal registers an `f64` tensor. Five arrays of literals in
+  the tests did that, and eight tests failed with `WrongDType` because of
+  them, before the literals were given a type.
+
 ## Tile kernels
 
 `tilekernels` holds kernels written in cuTile Rust, each tested against a
@@ -584,7 +627,13 @@ What this shows:
 
 - The budget is the manager's own accounting, not the driver's free-memory
   counter, and unmanaged allocations (here the two accumulators) are outside it.
-- Single GPU, single thread, `f32` tensors only in the benchmark.
+- Single GPU, single thread. The manager holds tensors of any element type
+  under one byte budget; the benchmark still uses only `f32`.
+- The element type is checked when a tensor is read back, not when the code
+  is compiled: `tensor::<T>`, `tensor_mut::<T>` and `unregister::<T>` return
+  `TierError::WrongDType` if `T` is not the type the tensor was registered
+  with. Tensors with no elements and tensors of rank 0 are still not
+  supported.
 - A modified tensor is copied back ahead of time only alongside automatic
   prefetch or when `write_back` is called. An eviction forced by an access
   still waits for the copy, and rebuilding a reconstructible tensor is
