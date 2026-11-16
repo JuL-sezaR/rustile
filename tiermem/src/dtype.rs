@@ -24,8 +24,13 @@ pub(crate) struct DTypeOps {
     pub elem_bytes: usize,
     /// The device address of the tensor's first element.
     pub device_ptr: fn(&Erased) -> sys::CUdeviceptr,
-    /// A 1-D tensor of this many elements, not yet initialized.
-    pub alloc: fn(&ExecutionContext, usize) -> Result<Box<Erased>, DeviceError>,
+    /// A 1-D tensor of this many elements, **not initialized**.
+    ///
+    /// # Safety
+    /// The caller must write every element of the returned tensor, with work
+    /// on the context's stream, before anything reads it. A tensor of a type
+    /// such as `bool` is undefined behaviour to read with the wrong bytes.
+    pub alloc: unsafe fn(&ExecutionContext, usize) -> Result<Box<Erased>, DeviceError>,
     /// Gives a 1-D tensor of this type the shape it had before it was spilled.
     pub reshape: ReshapeFn,
 }
@@ -42,8 +47,9 @@ pub(crate) fn ops<T: DType>() -> DTypeOps {
                 .cu_deviceptr()
         },
         alloc: |ctx, elements| {
-            // SAFETY: the copy that follows initializes every element before
-            // the submission completes, which is the earliest anyone can read it.
+            // SAFETY: `execute` is given the context it will run on. The
+            // tensor is handed out uninitialized, and the contract of this
+            // function pointer makes the caller initialize it before any read.
             let tensor = unsafe {
                 Tensor::<T>::uninitialized(elements)
                     .execute(ctx)?

@@ -73,7 +73,10 @@ impl DeviceOp for LoadFromHost {
                 "cannot reload an empty tensor".into(),
             ));
         }
-        let tensor = (self.ops.alloc)(ctx, elements)?;
+        // SAFETY: the copy enqueued below writes every element of the tensor,
+        // on the same stream, before the submission completes, which is the
+        // earliest anyone can read it.
+        let tensor = unsafe { (self.ops.alloc)(ctx, elements)? };
         let dst = (self.ops.device_ptr)(&*tensor);
         let src = self.host.as_ptr::<u8>().cast_const();
         ctx.retain(self.host)?;
