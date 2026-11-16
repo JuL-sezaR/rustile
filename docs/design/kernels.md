@@ -36,7 +36,8 @@ Rules for whoever implements a step:
 | 3 | Done: code, tests and README table. |
 | 4 | Done: code, tests and README table. |
 | 5 | Done: code, tests and README table. The tile sweep kept the default 64 × 64 × 32 (32 × 32 × 32 was 3% slower, 16³ and 64 × 64 × 64 about twice as slow). |
-| 6 to 8 | Not started. |
+| 6 | Code and tests done on `manager-any-dtype` (60 manager tests pass). The benchmark and README wait for the user's before/after numbers. |
+| 7 to 8 | Not started. |
 
 ## State on 2026-11-13
 
@@ -740,6 +741,12 @@ elements and tensors of rank 0. Their behavior stays what it is today.
   `reloaded_spill`, `big_manager`, `contents`) become `Manager`. The file has
   9 calls of `.tensor(`, 5 of `.tensor_mut(` and 23 of `.unregister(`; add
   `::<f32>` wherever inference no longer finds the type.
+- **Trap, found in step 6:** `Manager<f32>` used to force every registered
+  tensor to `f32`. Now an unconstrained float literal defaults to `f64`, and
+  the code still compiles: `[7.0, 1.0].map(|v| m.register(api::full(v, ..)))`
+  registered `f64` tensors in five tests (found by 8 failures that looked like
+  prefetch bugs; the message was `WrongDType { stored: F64, requested: F32 }`).
+  Write `7.0f32` in those arrays.
 - `tiermem/examples/overbudget.rs` has no `Manager<..>` annotation. It has
   two calls, `mgr.tensor(id)?` (line 278) and `mgr.tensor_mut(id)?` (line
   282), which may need `::<f32>`.
