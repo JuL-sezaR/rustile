@@ -406,11 +406,12 @@ and a `[1024]` F64 tensor 8192, and they evict each other like any other
 tensors. Copies between the device and host memory move bytes and need no
 element type.
 
-This changes no behavior for `f32`, and that was measured. The previous
-commit and this one were run alternately, 3 rounds of each command (each run
-`--runs 5` in one process after its own warmup), because the benchmark
-varies between sessions and between cases (issue #12). RTX 5080 Laptop,
-WSL2, 2026-11-16. Each cell is the range of the three per-round medians.
+For read-only `f32` layers under `spill --lookahead`, which is what was
+measured, this changed nothing. The previous commit and this one were run
+alternately, 3 rounds of each command (each run `--runs 5` in one process
+after its own warmup), because the benchmark varies between sessions and
+between cases (issue #12). RTX 5080 Laptop, WSL2, 2026-11-16. Each cell is
+the range of the three per-round medians.
 
 | Command | Time, before | Time, after | Run, before | Run, after |
 |---|---|---|---|---|
@@ -420,15 +421,21 @@ WSL2, 2026-11-16. Each cell is the range of the three per-round medians.
 
 What this shows:
 
-- **Nothing changed.** The before and after ranges overlap in every cell.
-- **The counters are identical in all nine pairs**: evictions, clean
+- **Nothing changed in these three commands.** The before and after ranges
+  overlap in every cell.
+- **Their counters are identical in all nine pairs**: evictions, clean
   evictions, reloads, prefetches, bytes moved, peak resident and pressure
   events (for example 35 evictions, 27 reloads and 2432 MiB moved for the
-  first command). The change did not alter what the manager decides, only
-  how it stores the tensors.
+  first command). In these runs the change did not alter what the manager
+  decides, only how it stores the tensors.
+- **Not benchmarked:** copying a modified tensor back (`--dirty`), `rebuild`
+  mode, a host limit, eager allocation and the LRU policy all go through code
+  that changed. The tests check that they still give the right contents and
+  counters; their speed was not measured.
 - A mistake that the compiler no longer catches: with `Manager<f32>` gone,
-  a bare float literal registers an `f64` tensor. Eight tests did that and
-  failed with `WrongDType`, before the literals were given a type.
+  a bare float literal registers an `f64` tensor. Five arrays of literals in
+  the tests did that, and eight tests failed with `WrongDType` because of
+  them, before the literals were given a type.
 
 ## Tile kernels
 
