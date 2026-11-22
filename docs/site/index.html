@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustile · tiermem, a VRAM budget manager for Rust</title>
+<meta name="description" content="tiermem keeps ML tensors inside a GPU memory budget. It spills to pinned host RAM and evicts by declared access order, so a 768 MiB working set runs correctly under a 256 MiB budget.">
+<meta name="theme-color" content="#121211">
+<link rel="canonical" href="https://jul-sezar.github.io/rustile/">
+
+<meta property="og:type" content="website">
+<meta property="og:title" content="rustile · tiermem, a VRAM budget manager for Rust">
+<meta property="og:description" content="Run a working set larger than your VRAM. Belady eviction and pinned host memory, built on cuTile Rust.">
+<meta property="og:url" content="https://jul-sezar.github.io/rustile/">
+<meta property="og:image" content="https://jul-sezar.github.io/rustile/assets/brand/social-preview.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="The rustile wordmark, built from square tiles, with one orange tile.">
+<meta name="twitter:card" content="summary_large_image">
+
+<link rel="icon" href="favicon.ico" sizes="48x48">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+
+<link rel="preload" href="assets/fonts/big-shoulders-display-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="assets/fonts/jetbrains-mono-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="assets/css/site.css">
+<script>document.documentElement.classList.add('js');</script>
+<script src="assets/js/site.js" defer></script>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M4 12 12 4M5 4h7v7" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 16 16"><path d="M6 6h8v8H6zM10 6V2H2v8h4" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+  <symbol id="i-check" viewBox="0 0 16 16"><path d="M2 8.5 6 12.5 14 3.5" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 16 16"><path d="M3 2h4v12H3zM9 2h4v12H9z" fill="currentColor"/></symbol>
+  <symbol id="i-play" viewBox="0 0 16 16"><path d="M4 2l10 6-10 6z" fill="currentColor"/></symbol>
+</svg>
+
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="bar plate--dark">
+  <div class="wrap bar-inner">
+    <a class="brand" href="#top" aria-label="rustile, back to the top">
+      <img src="assets/brand/mark-dark.svg" width="21" height="32" alt="">
+      <span class="brand-text">tiermem v0.1<span class="brand-sub"> · VRAM budget manager</span></span>
+    </a>
+    <nav class="nav" aria-label="Sections">
+      <ul>
+        <li><a href="#overview">Overview</a></li>
+        <li><a href="#design">Design</a></li>
+        <li><a href="#status">Status</a></li>
+        <li><a href="#install">Install</a></li>
+      </ul>
+    </nav>
+    <a class="bar-gh" href="https://github.com/JuL-sezaR/rustile">GitHub <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+  </div>
+</header>
+
+<main id="main">
+
+<!-- HERO -->
+<section class="plate plate--dark hero" id="top" aria-labelledby="hero-title">
+  <div class="wrap">
+    <div class="wordmark">
+      <img id="wm" src="assets/brand/wordmark-dark.svg" width="750" height="152" alt="rustile"
+           data-still="assets/brand/wordmark-dark.svg" data-anim="assets/brand/wordmark-animated-dark.svg" fetchpriority="high">
+      <button class="motion" id="wm-toggle" type="button" hidden>
+        <svg class="i" aria-hidden="true"><use href="#i-pause"/></svg><span>Pause animation</span>
+      </button>
+    </div>
+
+    <div class="grid hero-grid">
+      <div class="hero-copy">
+        <h1 class="h1" id="hero-title">Run a working set larger than your VRAM.</h1>
+        <p class="lead">tiermem is a Rust library that keeps your tensors inside a memory budget. When the budget is full, it moves the tensors you are not using to pinned host RAM and brings them back before the next layer needs them.</p>
+        <div class="actions">
+          <a class="btn btn--primary" href="https://github.com/JuL-sezaR/rustile">View on GitHub <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+          <a class="link" href="#install">Jump to the quick start</a>
+        </div>
+      </div>
+
+      <div class="ledger-wrap">
+        <table class="ledger">
+          <caption>12 layers of 64 MiB (768 MiB) through a 256 MiB budget, three passes</caption>
+          <thead>
+            <tr><th scope="col">Mode</th><th scope="col">Outcome</th><th scope="col" class="num">Misses</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row">strict</th><td><i class="tile tile--stop" aria-hidden="true"></i>Stops at layer 4 with a recoverable <code>BudgetExceeded</code></td><td class="num">n/a</td></tr>
+            <tr><th scope="row">spill, LRU</th><td><i class="tile" aria-hidden="true"></i>Correct</td><td class="num">36 of 36</td></tr>
+            <tr><th scope="row">spill, lookahead</th><td><i class="tile" aria-hidden="true"></i>Correct</td><td class="num">27 of 36</td></tr>
+            <tr><th scope="row">fits in budget</th><td><i class="tile" aria-hidden="true"></i>Correct</td><td class="num">0</td></tr>
+          </tbody>
+        </table>
+        <p class="fine">RTX 5080 Laptop, WSL2. Measured <span class="nb">2026-10-18</span> and <span class="nb">2026-10-29</span>. Source: the README, Milestone 1 and Lookahead eviction.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- WHAT IT IS -->
+<section class="plate plate--light" id="overview" aria-labelledby="overview-title">
+  <div class="wrap">
+    <div class="grid intro">
+      <h2 class="h2" id="overview-title">A budget for GPU memory, kept in user space.</h2>
+      <div class="intro-copy">
+        <p>A <code>Manager</code> owns your device tensors, whatever their element type, and keeps their total size in bytes under a VRAM budget. Each tensor carries a hint that says how costly it is to evict.</p>
+        <p>When a reload would go over budget, the manager evicts lower priority tensors instead of failing. It spills them to pinned host RAM, or drops them if you gave it a way to rebuild them. Where a plain allocation would run out of memory, you get an eviction, or at worst a recoverable error that says what held the memory.</p>
+        <p class="side">The budget is logical: the manager's own accounting of the bytes it has admitted, not the driver's free memory counter. A 16 GB card can stand in for a much smaller one.</p>
+        <p class="side">It builds on cuTile Rust and stays in user space. Quotas and isolation across processes (cgroups, eBPF, HMM) come later, once this API has proved itself.</p>
+      </div>
+    </div>
+
+    <dl class="features">
+      <div><dt class="title">Residency hints</dt><dd><code>Pinned</code> is never evicted. <code>Hot</code> goes after every <code>Evictable</code> tensor. <code>Evictable</code> goes whenever room is needed.</dd></div>
+      <div><dt class="title">Spill or rebuild</dt><dd>Copy a tensor to host RAM and back, or drop it and rebuild it with a function you supply.</dd></div>
+      <div><dt class="title">Lookahead eviction</dt><dd>Declare your access order with <code>expect_accesses</code> and the manager evicts the tensor you need farthest in the future.</dd></div>
+      <div><dt class="title">Prefetch and write back</dt><dd>Copies run on CUDA streams the manager owns, so a reload can overlap with your kernels.</dd></div>
+      <div><dt class="title">Host memory limit</dt><dd>Cap the pinned RAM held for spilled tensors. At the cap a spill fails with a recoverable error and the tensor stays on the device.</dd></div>
+      <div><dt class="title">Pressure callbacks</dt><dd>Get told when residency crosses a soft limit. Hysteresis cut the benchmark from 45 events to 1.</dd></div>
+      <div><dt class="title">Recoverable errors</dt><dd><code>BudgetExceeded</code> and <code>HostBudgetExceeded</code> carry a snapshot of what is resident, so you can decide what to do next.</dd></div>
+      <div><dt class="title">Any element type</dt><dd>BF16, F32, F64, I64 and U8 tensors share one budget. Sizes are counted in bytes.</dd></div>
+      <div><dt class="title">A timeline you can open</dt><dd>Write a Chrome trace of every copy and eviction and open it in ui.perfetto.dev.</dd></div>
+    </dl>
+
+    <div class="crates">
+      <h3 class="title">In the repository</h3>
+      <ul>
+        <li><code>tiermem</code><span>The VRAM budget manager this page is about.</span></li>
+        <li><code>tilekernels</code><span>Tile kernels on cuTile Rust, each tested against a CPU reference: softmax, RMSNorm, embedding gather and a linear layer.</span></li>
+        <li><code>vecadd</code><span>The original cuTile hello world: one tile kernel that adds two vectors.</span></li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- TAGLINE -->
+<section class="plate plate--rust tagline-plate" aria-label="In short">
+  <div class="wrap">
+    <div class="budget-row" aria-hidden="true">
+      <i class="t on"></i><i class="t on"></i><i class="t on"></i><i class="t on"></i><i class="t"></i><i class="t"></i><i class="t"></i><i class="t"></i><i class="t"></i><i class="t"></i><i class="t"></i><i class="t"></i>
+    </div>
+    <p class="tagline" id="tagline">Your layers run in a known order. Say so once, and tiermem evicts the layer you need last and reloads the layer you need next while your kernel is still running.</p>
+  </div>
+</section>
+
+<!-- DESIGN -->
+<section class="plate plate--dark" id="design" aria-labelledby="design-title">
+  <div class="wrap">
+    <div class="grid intro">
+      <h2 class="h2" id="design-title">Belady eviction and pinned memory</h2>
+      <div class="intro-copy">
+        <p>Two decisions shape the numbers at the top of this page: which tensor leaves when room is needed, and how the bytes travel when it does.</p>
+      </div>
+    </div>
+
+    <div class="block">
+      <h3 class="h3">Evict the layer you need last</h3>
+      <div class="grid split">
+        <div class="split-copy">
+          <p>Least recently used is the worst case for a layer sweep. After layer 11 comes layer 0 again, and LRU has just thrown it out, so every access misses.</p>
+          <p>A model's layer order is predictable. Declare it with <code>Manager::expect_accesses</code> and choose <code>Policy::EvictLookahead</code>. Within a hint rank the manager evicts tensors with no declared use first, then the one needed farthest in the future. That is Belady's rule, and it is optimal for the number of misses.</p>
+        </div>
+        <p class="split-note">The simulation below applies each policy to the benchmark's access pattern: 12 layers, 4 slots in VRAM, 3 passes. Drag the slider or press play.</p>
+      </div>
+
+      <div class="sim" id="sim">
+        <p class="sim-static">With LRU all 36 accesses miss. With lookahead 27 do. The interactive view needs JavaScript.</p>
+        <div class="sim-ui" hidden>
+          <div class="sim-controls">
+            <button type="button" class="btn btn--sm" id="sim-play"><svg class="i" aria-hidden="true"><use href="#i-play"/></svg><span>Play</span></button>
+            <div class="scrub">
+              <label for="sim-scrub">Access <output id="sim-now" for="sim-scrub">36</output> of 36</label>
+              <input id="sim-scrub" type="range" min="0" max="36" step="1" value="36">
+            </div>
+            <ul class="legend">
+              <li><i class="tile tile--hit" aria-hidden="true"></i>Hit: already in VRAM</li>
+              <li><i class="tile tile--miss" aria-hidden="true"></i>Miss: reload from host RAM</li>
+            </ul>
+          </div>
+          <div class="sim-panels">
+            <article class="panel" data-policy="lru" aria-labelledby="p-lru">
+              <h4 class="title" id="p-lru">Least recently used</h4>
+              <p class="count"><span data-count>36</span> of 36 accesses miss</p>
+              <ol class="strip" data-strip></ol>
+              <div class="slots" data-slots></div>
+              <p class="step-note" data-note></p>
+            </article>
+            <article class="panel" data-policy="belady" aria-labelledby="p-belady">
+              <h4 class="title" id="p-belady">Lookahead, Belady's rule</h4>
+              <p class="count"><span data-count>27</span> of 36 accesses miss</p>
+              <ol class="strip" data-strip></ol>
+              <div class="slots" data-slots></div>
+              <p class="step-note" data-note></p>
+            </article>
+          </div>
+        </div>
+      </div>
+      <p class="fine">27 is the floor for 12 layers in 4 slots: three layers stay resident and the other nine rotate through the fourth slot. This is a simulation of the policy. The measured runs, with times, are in the README.</p>
+    </div>
+
+    <div class="block">
+      <h3 class="h3">Spill into pinned memory, copy on streams of their own</h3>
+      <div class="grid split">
+        <ul class="ticks split-copy">
+          <li>Spilled contents live in pinned (page locked) host memory, so the driver copies straight to and from the buffer instead of staging through its own.</li>
+          <li>Every copy runs on a CUDA stream the manager owns, one per direction, apart from the streams your kernels use.</li>
+          <li><code>Manager::prefetch(&amp;ids)</code> submits a reload and returns. With <code>Config::prefetch_depth = n</code> each access starts reloading the next <code>n</code> tensors you declared.</li>
+          <li>A pool hands out the pinned blocks. A block given back serves a later spill without being locked again. <code>HostAlloc::Lazy</code> locks as needed, <code>HostAlloc::Eager</code> locks one arena up front. Locking costs about 0.3 ms per MiB either way.</li>
+          <li><code>Config::host_limit_bytes</code> caps the pinned RAM held. At the cap a spill fails with <code>HostBudgetExceeded</code>, which is recoverable.</li>
+        </ul>
+
+        <div class="split-data">
+          <figure class="bw">
+            <figcaption>A 64 MiB reload takes 2.46 ms. That is 27 GB/s on a link that carries 31.5 GB/s (PCIe 5.0 x8) before protocol overhead, so at most about 15% is left to gain from faster copies.</figcaption>
+            <div class="tilebar" data-total="63" data-filled="54" role="img" aria-label="27 of 31.5 gigabytes per second used"></div>
+            <p class="fine">Trace of a 30 epoch run, 264 reloads. RTX 5080 Laptop, WSL2, <span class="nb">2026-11-12</span>.</p>
+          </figure>
+
+          <table class="data">
+            <caption>Prefetch hides most of the copy cost, once there is compute to hide it behind</caption>
+            <thead>
+              <tr><th scope="col">Work per layer</th><th scope="col" class="num">Fits in budget</th><th scope="col" class="num">No prefetch</th><th scope="col" class="num">Prefetch 1</th><th scope="col" class="num">Hidden</th></tr>
+            </thead>
+            <tbody>
+              <tr><th scope="row">1 kernel, about 0.3 ms</th><td class="num">0.12 s</td><td class="num">0.87 s</td><td class="num">0.84 s</td><td class="num">none</td></tr>
+              <tr><th scope="row">8 kernels, about 2.7 ms</th><td class="num">0.92 s</td><td class="num">1.69 s</td><td class="num">1.12 s</td><td class="num">about 70%</td></tr>
+              <tr><th scope="row">32 kernels, about 10 ms</th><td class="num">3.74 s</td><td class="num">4.27 s</td><td class="num">3.90 s</td><td class="num">about 70%</td></tr>
+            </tbody>
+          </table>
+          <p class="fine">Read only layers, lookahead policy, 30 epochs, run phase only. Median of 5 processes after one warmup. RTX 5080 Laptop, WSL2, <span class="nb">2026-11-12</span>. Run to run variance is about 10%. With almost no compute per layer there is nothing to overlap with, so prefetch gains nothing.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- STATUS -->
+<section class="plate plate--light" id="status" aria-labelledby="status-title">
+  <div class="wrap">
+    <div class="grid intro">
+      <h2 class="h2" id="status-title">Milestone 1 is done. Milestone 2 is on hold.</h2>
+      <div class="intro-copy">
+        <p>What is built and measured is in the README. What is only an idea is in NOVELTIES.md. This page keeps the same line between them.</p>
+      </div>
+    </div>
+
+    <ol class="timeline">
+      <li>
+        <span class="mark mark--done" aria-hidden="true"></span>
+        <div>
+          <h3 class="title">Milestone 1: run a working set larger than the budget</h3>
+          <p>Lookahead eviction, clean host copies, a pinned host pool with a limit, prefetch and asynchronous write back, pressure callbacks with hysteresis, one manager for every element type. Every number is in the README with its hardware and date.</p>
+        </div>
+        <p class="state">Done</p>
+      </li>
+      <li>
+        <span class="mark mark--done" aria-hidden="true"></span>
+        <div>
+          <h3 class="title">Tile kernels on cuTile Rust</h3>
+          <p>Softmax, RMSNorm, embedding gather and a linear layer, each tested against a CPU reference. They do not run on tensors the manager holds yet.</p>
+        </div>
+        <p class="state">Done</p>
+      </li>
+      <li>
+        <span class="mark mark--hold" aria-hidden="true"></span>
+        <div>
+          <h3 class="title">Milestone 2: a real model through tiermem</h3>
+          <p>A feasibility report on ARC 1.0 found that its backbone cannot run from Rust on tiermem managed memory without large custom work, so that route is on hold. The basic kernels come first, and the model is chosen after them.</p>
+        </div>
+        <p class="state">On hold</p>
+      </li>
+      <li>
+        <span class="mark mark--idea" aria-hidden="true"></span>
+        <div>
+          <h3 class="title">Milestone 3: memory aware model routing</h3>
+          <p>A router that picks between local and cloud models would also know whether the local model fits in VRAM right now. An idea in NOVELTIES.md. Nothing is built or measured.</p>
+        </div>
+        <p class="state">Proposed</p>
+      </li>
+      <li>
+        <span class="mark mark--idea" aria-hidden="true"></span>
+        <div>
+          <h3 class="title">Quotas and isolation across processes</h3>
+          <p>Through cgroups, eBPF or HMM. Not started, and not before the single process API has proved itself.</p>
+        </div>
+        <p class="state">Not started</p>
+      </li>
+    </ol>
+
+    <div class="limits">
+      <h3 class="title">What it does not do yet</h3>
+      <ul class="ticks">
+        <li>One GPU and one thread.</li>
+        <li>The budget is the manager's own accounting. Allocations it does not manage are outside it.</li>
+        <li>The element type is checked when a tensor is read back, not at compile time. A wrong type returns <code>WrongDType</code>.</li>
+        <li>The benchmark GPU reports one async copy engine, so reloads and write backs take turns. Devices with more engines are untested.</li>
+        <li>An eviction forced by an access still waits for its copy.</li>
+        <li>Kernel benchmark cases cannot be compared with each other to better than about 35% (issue 12).</li>
+      </ul>
+      <p class="fine">The full list is the Limitations section of the <a href="https://github.com/JuL-sezaR/rustile#limitations">README</a>. Open work is in the <a href="https://github.com/JuL-sezaR/rustile/issues">issues</a>.</p>
+    </div>
+  </div>
+</section>
+
+<!-- INSTALL -->
+<section class="plate plate--dark" id="install" aria-labelledby="install-title">
+  <div class="wrap">
+    <div class="grid intro">
+      <h2 class="h2" id="install-title">Clone it and run the benchmark.</h2>
+      <div class="intro-copy">
+        <p>You need an NVIDIA GPU, a CUDA toolkit that cutile 0.4 supports, and a Rust toolchain with edition 2024 (Rust 1.85 or newer). tiermem is not on crates.io, so you build it from the repository.</p>
+      </div>
+    </div>
+
+    <div class="cmds">
+      <figure class="cmd">
+        <figcaption class="cmd-cap"><span class="step">1</span>Clone the repository</figcaption>
+        <div class="cmd-body">
+          <pre tabindex="0"><code id="c-clone">git clone https://github.com/JuL-sezaR/rustile.git
+cd rustile</code></pre>
+          <span class="copy"><button type="button" class="copy-btn" command="--copy" commandfor="c-clone" aria-label="Copy clone commands"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-label">Copy</span></button><span class="tip" role="status"></span></span>
+        </div>
+      </figure>
+
+      <figure class="cmd">
+        <figcaption class="cmd-cap"><span class="step">2</span>Run the tests, which run on the GPU</figcaption>
+        <div class="cmd-body">
+          <pre tabindex="0"><code id="c-test">cargo test -p tiermem</code></pre>
+          <span class="copy"><button type="button" class="copy-btn" command="--copy" commandfor="c-test" aria-label="Copy test command"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-label">Copy</span></button><span class="tip" role="status"></span></span>
+        </div>
+      </figure>
+
+      <figure class="cmd">
+        <figcaption class="cmd-cap"><span class="step">3</span>Watch the strict baseline stop at its budget</figcaption>
+        <div class="cmd-body">
+          <pre tabindex="0"><code id="c-strict">cargo run --release -p tiermem --example overbudget -- strict</code></pre>
+          <span class="copy"><button type="button" class="copy-btn" command="--copy" commandfor="c-strict" aria-label="Copy strict benchmark command"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-label">Copy</span></button><span class="tip" role="status"></span></span>
+        </div>
+      </figure>
+
+      <figure class="cmd">
+        <figcaption class="cmd-cap"><span class="step">4</span>Run it again with lookahead eviction and prefetch</figcaption>
+        <div class="cmd-body">
+          <pre tabindex="0"><code id="c-spill">cargo run --release -p tiermem --example overbudget -- spill --lookahead --prefetch 1</code></pre>
+          <span class="copy"><button type="button" class="copy-btn" command="--copy" commandfor="c-spill" aria-label="Copy lookahead benchmark command"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-label">Copy</span></button><span class="tip" role="status"></span></span>
+        </div>
+      </figure>
+    </div>
+
+    <div class="block">
+      <h3 class="h3">Using it</h3>
+      <figure class="cmd cmd--wide">
+        <figcaption class="cmd-cap"><span>Adapted from</span> <code>tiermem/examples/overbudget.rs</code></figcaption>
+        <div class="cmd-body">
+          <pre tabindex="0"><code id="c-api">use tiermem::{Config, Hint, Manager, Policy};
+
+let budget = 256 * 1024 * 1024; // bytes of VRAM the manager may use
+let mut mgr = Manager::new(Config {
+    prefetch_depth: 1, // start reloading the next tensor early
+    ..Config::new(budget, Policy::EvictLookahead)
+});
+
+let id = mgr.register(weights, Hint::Evictable)?; // a device tensor in, an id out
+mgr.expect_accesses(&amp;layer_ids)?;                 // declare the order you will use them in
+
+mgr.ensure_resident(&amp;[id])?;                      // reload it if it was spilled
+let w = mgr.tensor::&lt;f32&gt;(id)?;                   // borrow it for a kernel launch</code></pre>
+          <span class="copy"><button type="button" class="copy-btn" command="--copy" commandfor="c-api" aria-label="Copy Rust example"><svg class="i" aria-hidden="true"><use href="#i-copy"/></svg><span class="copy-label">Copy</span></button><span class="tip" role="status"></span></span>
+        </div>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<!-- CLOSE -->
+<section class="plate plate--rust close" id="close" aria-labelledby="close-title">
+  <div class="wrap grid">
+    <h2 class="h1 close-title" id="close-title"><span>Read the code.</span> <span>Run the benchmark.</span></h2>
+    <div class="close-tile">
+      <p>tiermem is MIT licensed and developed in the open. The README has every measurement, with its hardware and date.</p>
+      <a class="btn btn--primary" href="https://github.com/JuL-sezaR/rustile">View on GitHub <svg class="i" aria-hidden="true"><use href="#i-arrow"/></svg></a>
+    </div>
+    <img class="close-mark" src="assets/brand/wordmark-on-rust.svg" width="750" height="126" alt="rustile">
+  </div>
+</section>
+
+</main>
+
+<footer class="plate plate--light foot">
+  <div class="wrap foot-inner">
+    <ul class="foot-links">
+      <li><a href="https://github.com/JuL-sezaR/rustile">Repository</a></li>
+      <li><a href="https://github.com/JuL-sezaR/rustile/blob/main/README.md">README</a></li>
+      <li><a href="https://github.com/JuL-sezaR/rustile/blob/main/NOVELTIES.md">Novelties</a></li>
+      <li><a href="https://github.com/JuL-sezaR/rustile/blob/main/docs/milestone-2-feasibility.md">Milestone 2 report</a></li>
+      <li><a href="https://github.com/JuL-sezaR/rustile/issues">Issues</a></li>
+      <li><a href="https://github.com/JuL-sezaR/rustile/blob/main/LICENSE">MIT licence</a></li>
+    </ul>
+    <p class="fine">This page sets no cookies, runs no analytics and loads nothing from other sites.</p>
+  </div>
+</footer>
+
+</body>
+</html>
