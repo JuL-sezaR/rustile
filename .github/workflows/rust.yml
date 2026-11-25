@@ -1,0 +1,71 @@
+# Checks the Rust workspace on every pull request and on pushes to main.
+#
+# The build needs the CUDA headers (cuda-bindings reads cuda.h), so the lint
+# job runs in NVIDIA's devel image. The tests need a GPU and a driver at run
+# time, which hosted runners do not have. The gpu job runs on a self-hosted
+# runner with a GPU; it is skipped until the repository variable GPU_RUNNER
+# is set to "true" and such a runner is registered with the labels below.
+
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:13.3.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends curl ca-certificates
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal -c clippy,rustfmt
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build the tests
+        run: cargo test --workspace --no-run
+
+      # Only the tests that need no GPU. The rest run in the gpu job.
+      - name: Tests without a GPU
+        run: cargo test -p tilekernels --test float_out
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit
+
+  gpu:
+    if: vars.GPU_RUNNER == 'true'
+    runs-on: [self-hosted, linux, gpu]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Tests on the GPU
+        run: cargo test --workspace
