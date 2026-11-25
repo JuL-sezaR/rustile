@@ -57,7 +57,10 @@ jobs:
         run: cargo audit
 
   gpu:
-    if: vars.GPU_RUNNER == 'true'
+    # Never for forks: a fork's pull request must not run code on this machine.
+    if: >-
+      vars.GPU_RUNNER == 'true' &&
+      (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, gpu]
     steps:
       - uses: actions/checkout@v4
