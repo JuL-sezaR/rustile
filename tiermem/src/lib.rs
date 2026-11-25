@@ -1,8 +1,8 @@
 //! Workload-aware GPU memory tiering.
 //!
 //! A [`Manager`] owns a set of registered device tensors, of any element type,
-//! and keeps their total size in bytes under a VRAM budget. Each tensor carries a [`Hint`] saying how costly
-//! it is to evict. When an admission or reload would exceed the budget, the
+//! and keeps their total size in bytes under a VRAM budget. Each tensor carries
+//! a [`Hint`] saying how costly it is to evict. When an admission or reload would exceed the budget, the
 //! manager evicts lower-priority tensors first (spilling them to host RAM, or
 //! dropping them if they can be rebuilt) instead of failing.
 //!

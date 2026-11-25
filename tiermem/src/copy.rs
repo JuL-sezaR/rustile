@@ -67,12 +67,7 @@ impl DeviceOp for LoadFromHost {
 
     unsafe fn execute(self, ctx: &ExecutionContext) -> Result<Box<Erased>, DeviceError> {
         let bytes = self.host.bytes();
-        let elements = bytes / self.ops.elem_bytes;
-        if elements == 0 {
-            return Err(DeviceError::Internal(
-                "cannot reload an empty tensor".into(),
-            ));
-        }
+        let elements = element_count(bytes, self.ops.elem_bytes)?;
         // SAFETY: the copy enqueued below writes every element of the tensor,
         // on the same stream, before the submission completes, which is the
         // earliest anyone can read it.
@@ -80,11 +75,30 @@ impl DeviceOp for LoadFromHost {
         let dst = (self.ops.device_ptr)(&*tensor);
         let src = self.host.as_ptr::<u8>().cast_const();
         ctx.retain(self.host)?;
-        // SAFETY: both sides hold `bytes` bytes; the host block is retained
-        // by the submission and the tensor by the future's result.
+        // SAFETY: the tensor holds exactly `elements * elem_bytes == bytes`
+        // bytes (checked by `element_count`), and the host block holds
+        // `bytes` bytes. The host block is retained by the submission and the
+        // tensor by the future's result.
         unsafe { memcpy_htod_async(dst, src, bytes, ctx.get_cuda_stream())? };
         Ok(tensor)
     }
+}
+
+/// The number of elements in a host block of `bytes` bytes. The copy moves
+/// exactly `bytes` bytes, so the block must be a whole, non-zero number of
+/// elements; otherwise the copy would write past the end of the tensor.
+fn element_count(bytes: usize, elem_bytes: usize) -> Result<usize, DeviceError> {
+    if bytes == 0 {
+        return Err(DeviceError::Internal(
+            "cannot reload an empty tensor".into(),
+        ));
+    }
+    if !bytes.is_multiple_of(elem_bytes) {
+        return Err(DeviceError::Internal(
+            "host block is not a whole number of elements".into(),
+        ));
+    }
+    Ok(bytes / elem_bytes)
 }
 
 macro_rules! impl_into_future {
@@ -158,5 +172,60 @@ impl<Op: DeviceOp> Pending<Op> {
             }
             std::thread::yield_now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::element_count;
+
+    #[test]
+    fn whole_elements_are_counted() {
+        assert_eq!(element_count(8, 4).unwrap(), 2);
+        assert_eq!(element_count(2, 2).unwrap(), 1);
+    }
+
+    #[test]
+    fn empty_and_partial_blocks_are_refused() {
+        assert!(element_count(0, 4).is_err());
+        assert!(element_count(6, 4).is_err());
+        assert!(element_count(1, 2).is_err());
+    }
+
+    /// On the GPU: a block that is not a whole number of `f32` is refused
+    /// before anything is copied, and a whole one is loaded with its contents.
+    #[test]
+    fn load_refuses_a_partial_element_block() {
+        use crate::dtype::ops;
+        use crate::host::HostPool;
+        use cutile::cuda_async::device_context::{get_default_device, with_device};
+        use cutile::prelude::*;
+        use std::sync::Arc;
+
+        let stream = with_device(get_default_device(), |device| device.new_stream())
+            .unwrap()
+            .unwrap();
+        let pool = HostPool::new(usize::MAX);
+
+        let partial = Arc::new(pool.alloc(stream.device(), 6, true).unwrap().unwrap());
+        let refused = super::LoadFromHost {
+            host: partial,
+            ops: ops::<f32>(),
+        }
+        .sync_on(&stream);
+        assert!(
+            matches!(&refused, Err(DeviceError::Internal(msg)) if msg.contains("whole number")),
+            "a partial element block must be refused by the guard, not by the driver"
+        );
+
+        let whole = Arc::new(pool.alloc(stream.device(), 8, true).unwrap().unwrap());
+        let loaded = super::LoadFromHost {
+            host: whole,
+            ops: ops::<f32>(),
+        }
+        .sync_on(&stream)
+        .unwrap();
+        let tensor = loaded.downcast_ref::<Tensor<f32>>().unwrap();
+        assert_eq!(tensor.size(), 2);
     }
 }
